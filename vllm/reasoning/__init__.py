@@ -84,6 +84,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "hunyuan_a13b_reasoning_parser",
         "HunyuanA13BReasoningParser",
     ),
+    "iquest_coder_v2": (
+        "iquest_coder_v2_reasoning_parser",
+        "IquestCoderV2ReasoningParser",
+    ),
     "hy_v3": (
         "hy_v3_reasoning_parser",
         "HYV3ReasoningParser",

@@ -84,6 +84,9 @@ class SpecDecodeBaseProposer:
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
         self._share_mtp_indices = False
+        self._iquest_multilayer_mtp = (
+            self.speculative_config.use_iquest_multilayer_mtp()
+        )
 
         self.device = device
         self.dtype = vllm_config.model_config.dtype
@@ -635,6 +638,20 @@ class SpecDecodeBaseProposer:
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
             return draft_token_ids.view(-1, self.num_speculative_tokens)
+
+        if self._iquest_multilayer_mtp:
+            return self._propose_iquest_mtp_chained(
+                hidden_states,
+                sample_hidden_states,
+                token_indices_to_sample,
+                per_layer_attn_metadata,
+                common_attn_metadata,
+                sampling_metadata,
+                num_tokens,
+                num_input_tokens,
+                cudagraph_runtime_mode,
+                num_tokens_across_dp,
+            )
 
         if self.uses_mrope:
             positions = self.mrope_positions[:, token_indices_to_sample]
@@ -1614,6 +1631,65 @@ class SpecDecodeBaseProposer:
                 "(communication: O(2*tp_size) vs O(vocab_size))."
             )
 
+    def _propose_iquest_mtp_chained(
+        self,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        token_indices_to_sample: torch.Tensor,
+        per_layer_attn_metadata: dict[str, object],
+        common_attn_metadata: CommonAttentionMetadata,
+        sampling_metadata: SamplingMetadata,
+        num_tokens: int,
+        num_input_tokens: int,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Run every trained MTP layer over the full query and its own KV cache."""
+        draft_token_ids, draft_probs = self._sample_draft_tokens(
+            sample_hidden_states, sampling_metadata
+        )
+        draft_token_ids_list = [draft_token_ids]
+        draft_probs_list = None if draft_probs is None else [draft_probs]
+        for step_idx in range(1, self.num_speculative_tokens):
+            # Preserve valid token IDs in rejected/padded query slots.
+            layer_input_ids = self.input_ids[:num_tokens].clone()
+            layer_input_ids[:-1] = self.input_ids[1:num_tokens]
+            layer_input_ids[token_indices_to_sample] = draft_token_ids.to(
+                layer_input_ids.dtype
+            )
+            self.input_ids[:num_tokens] = layer_input_ids
+            self.hidden_states[:num_tokens] = hidden_states[:num_tokens]
+            self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
+                self.input_ids[:num_input_tokens]
+            )
+            with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=self._get_slot_mapping(
+                    num_input_tokens, common_attn_metadata.slot_mapping
+                ),
+            ):
+                hidden_states = self.model.forward_mtp_layer(
+                    input_ids=None,
+                    positions=self._get_positions(num_input_tokens),
+                    hidden_states=self.hidden_states[:num_input_tokens],
+                    inputs_embeds=self.inputs_embeds[:num_input_tokens],
+                    spec_step_idx=step_idx,
+                )
+            draft_token_ids, draft_probs = self._sample_draft_tokens(
+                hidden_states[token_indices_to_sample], sampling_metadata
+            )
+            draft_token_ids_list.append(draft_token_ids)
+            if draft_probs_list is not None:
+                assert draft_probs is not None
+                draft_probs_list.append(draft_probs)
+        if draft_probs_list is not None:
+            self._last_draft_probs = torch.stack(draft_probs_list, dim=1)
+        return torch.stack(draft_token_ids_list, dim=1)
+
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -1624,11 +1700,14 @@ class SpecDecodeBaseProposer:
     ) -> None:
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
-        only_one_forward_pass = is_graph_capturing or self.parallel_drafting
+        only_one_forward_pass = (
+            is_graph_capturing or self.parallel_drafting
+        ) and not self._iquest_multilayer_mtp
         for fwd_idx in range(
             1 if only_one_forward_pass else self.num_speculative_tokens
         ):
-            if fwd_idx <= 1:
+            # Chained MTP keeps the full query span and coordinates DP once.
+            if fwd_idx == 0 or (fwd_idx == 1 and not self._iquest_multilayer_mtp):
                 cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
                     self._determine_batch_execution_and_padding(
                         num_tokens, use_cudagraphs=use_cudagraphs
@@ -1653,7 +1732,14 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
             ):
+                use_fixed_mtp_layer = self._iquest_multilayer_mtp and fwd_idx > 0
                 if self.supports_mm_inputs:
+                    input_ids = None
+                    inputs_embeds = self.inputs_embeds[:num_input_tokens]
+                elif use_fixed_mtp_layer:
+                    self.inputs_embeds[:num_input_tokens] = self.model.embed_input_ids(
+                        self.input_ids[:num_input_tokens]
+                    )
                     input_ids = None
                     inputs_embeds = self.inputs_embeds[:num_input_tokens]
                 else:
@@ -1667,7 +1753,11 @@ class SpecDecodeBaseProposer:
                 )
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
-                self.model(**kwargs)
+                if use_fixed_mtp_layer:
+                    kwargs["spec_step_idx"] = fwd_idx
+                    self.model.forward_mtp_layer(**kwargs)
+                else:
+                    self.model(**kwargs)
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """Some eagle3 heads (e.g., nvidia/gpt-oss-120b-Eagle3-v2) do not use auxiliary

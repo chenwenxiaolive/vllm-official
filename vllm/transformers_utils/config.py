@@ -114,6 +114,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     hy_v3="HYV3Config",
     hy_v4="HYV4Config",
     isaac="IsaacConfig",
+    iquest_moe_v1_3="IquestMoeV13Config",
     kimi_k2="DeepseekV3Config",  # Kimi K2 uses same architecture as DeepSeek V3
     kimi_linear="KimiLinearConfig",
     kimi_vl="KimiVLConfig",
