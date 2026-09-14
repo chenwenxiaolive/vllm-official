@@ -2449,6 +2449,24 @@ def _get_head_dtype(
     elif head_dtype is None:
         if torch.float32 not in current_platform.supported_dtypes:
             return dtype
+        if (
+            runner_type == "generate"
+            and getattr(config, "model_type", None) in ("iquest_moe_v1_3", "iquest_mtp")
+            and dtype in (torch.bfloat16, torch.float16)
+        ):
+            if envs.VLLM_BATCH_INVARIANT:
+                logger.warning_once(
+                    "M1 automatic FP32 logits are disabled in batch-invariant "
+                    "mode to preserve its GEMM execution path."
+                )
+                return dtype
+            logger.warning_once(
+                "M1 defaults to FP32 LM head logits to avoid rounding scores "
+                "to the model dtype before sampling. This can change generated "
+                'tokens. Set --hf-overrides \'{"head_dtype": "model"}\' '
+                "to use the model dtype for logits."
+            )
+            return torch.float32
         if runner_type == "pooling":
             return torch.float32
         return dtype

@@ -7,11 +7,14 @@ fp32, which is required for RL training-inference consistency.
 """
 
 import math
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from vllm import LLM, SamplingParams
+from vllm.config.model import _get_head_dtype
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -37,6 +40,42 @@ def _build_processor(vocab_size: int) -> LogitsProcessor:
     # The TP gather is orthogonal to the dtype behavior under test.
     lp._gather_logits = lambda logits: logits
     return lp
+
+
+@pytest.mark.parametrize("model_type", ["iquest_moe_v1_3", "iquest_mtp", "llama"])
+@pytest.mark.parametrize("override", [None, "model", "float32"])
+def test_m1_head_default_respects_explicit_overrides(monkeypatch, model_type, override):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    config = SimpleNamespace(model_type=model_type, head_dtype=override)
+    automatic = model_type != "llama" and override is None
+    expected = torch.float32 if automatic or override == "float32" else torch.bfloat16
+    with patch("vllm.config.model.logger.warning_once") as warning:
+        assert _get_head_dtype(config, torch.bfloat16, "generate") == expected
+    assert warning.called is automatic
+
+
+@pytest.mark.parametrize("model_type", ["iquest_moe_v1_3", "iquest_mtp"])
+def test_m1_head_default_preserves_batch_invariant_path(monkeypatch, model_type):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
+    config = SimpleNamespace(model_type=model_type)
+    with patch("vllm.config.model.logger.warning_once") as warning:
+        assert _get_head_dtype(config, torch.bfloat16, "generate") == torch.bfloat16
+    assert "batch-invariant" in warning.call_args.args[0]
+
+
+def test_m1_fp32_logits_preserve_ranking_lost_to_bf16(default_vllm_config, monkeypatch):
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
+    lp = _build_processor(2)
+    lp.head_dtype = _get_head_dtype(
+        SimpleNamespace(model_type="iquest_moe_v1_3"), torch.bfloat16, "generate"
+    )
+    hidden = torch.ones(1, 2, dtype=torch.bfloat16)
+    weight = torch.tensor([[1000, 0], [1000, 1]], dtype=torch.bfloat16)
+    logits = lp._get_logits(hidden, _FakeLmHead(weight), None)
+    assert logits.dtype == torch.float32
+    assert logits.tolist() == [[1000.0, 1001.0]]
+    assert logits.argmax(dim=-1).item() == 1
+    assert logits.to(torch.bfloat16).argmax(dim=-1).item() == 0
 
 
 def test_fp32_head_runs_projection_in_fp32(default_vllm_config):
