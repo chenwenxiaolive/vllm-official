@@ -12,6 +12,7 @@ from vllm.reasoning.iquest_coder_v2_reasoning_parser import (
 START = 100
 END = 101
 ASSISTANT = 102
+TOOL = 103
 
 
 @pytest.fixture
@@ -21,6 +22,7 @@ def tokenizer():
             "<think>": START,
             "</think>": END,
             "<|iquestcoder_assistant|>": ASSISTANT,
+            "<iquestcoder_tool_call>": TOOL,
         }
     )
 
@@ -33,6 +35,9 @@ def tokenizer():
         ("<think>line one\nline two</think>", ("line one\nline two", None)),
         ("<think>unfinished", ("unfinished", None)),
         ("</think>answer", (None, "answer")),
+        ("answer", (None, "answer")),
+        ("", (None, None)),
+        ("<iquestcoder_tool_call>call", (None, "<iquestcoder_tool_call>call")),
     ],
 )
 def test_implicit_or_explicit_reasoning_start(tokenizer, output, expected):
@@ -65,6 +70,9 @@ def test_thinking_flag_matches_checkpoint_template(tokenizer, chat_kwargs, enabl
         ([END, 1, ASSISTANT, 2], False, []),
         ([END, 1, START, 2], False, []),
         ([1, 2], False, []),
+        ([ASSISTANT, TOOL, 2, 3], True, [TOOL, 2, 3]),
+        ([TOOL, 1, ASSISTANT, 2], False, []),
+        ([START, 1, END, TOOL, 2], True, [TOOL, 2]),
     ],
 )
 def test_previous_turn_cannot_end_current_reasoning(tokenizer, tokens, ended, content):
@@ -109,6 +117,28 @@ def test_disabled_thinking_emits_content_from_first_token(tokenizer):
     assert parser.is_reasoning_end_streaming([1], iter([1]))
     assert parser.extract_content_ids([1, 2]) == [1, 2]
     assert parser.count_reasoning_tokens([1, 2]) == 0
+
+
+@pytest.mark.parametrize("single_token", [True, False])
+def test_adaptive_thinking_stream_routes_tool_call_to_content(tokenizer, single_token):
+    vocab = tokenizer.get_vocab()
+    if not single_token:
+        del vocab["<iquestcoder_tool_call>"]
+    parser = IquestCoderV2ReasoningParser(Mock(get_vocab=lambda: vocab))
+    text = '<iquestcoder_tool_call>{"name":"search"'
+    ids = [TOOL, 1] if single_token else [4, 5, 6]
+    first = parser.extract_reasoning_streaming("", text, text, [], ids, ids)
+    assert first.reasoning is None
+    assert first.content == text
+    tail = "}</iquestcoder_tool_call>"
+    second = parser.extract_reasoning_streaming(
+        text, text + tail, tail, ids, ids + [7], [7]
+    )
+    assert second.reasoning is None
+    assert second.content == tail
+    if single_token:
+        assert parser.is_reasoning_end_streaming(ids, iter(ids))
+        assert parser.count_reasoning_tokens([ASSISTANT] + ids + [7]) == 0
 
 
 @pytest.mark.parametrize(
