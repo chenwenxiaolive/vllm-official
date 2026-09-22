@@ -353,6 +353,9 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     "IQuestLoopCoderForCausalLM": _HfExamplesInfo(
         "IQuestLab/IQuest-Coder-V1-40B-Loop-Instruct", trust_remote_code=True
     ),
+    "IquestMoeV13ForCausalLM": _HfExamplesInfo(
+        "IQuestLab/IQuest-M1", is_available_online=False
+    ),
     "Jais2ForCausalLM": _HfExamplesInfo(
         "inceptionai/Jais-2-8B-Chat", min_transformers_version="4.58"
     ),
@@ -1785,6 +1788,11 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         tokenizer_mode="inkling",
         trust_remote_code=True,
         max_model_len=4096,
+    ),
+    "IquestMoeV13MTPModel": _HfExamplesInfo(
+        "IQuestLab/IQuest-M1",
+        speculative_model="IQuestLab/IQuest-M1",
+        is_available_online=False,
     ),
     "InternS2MobiusMTP": _HfExamplesInfo(
         "internlm/Intern-S2-Mobius",
