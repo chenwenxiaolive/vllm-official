@@ -48,7 +48,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -763,7 +763,7 @@ class IQuestQ1Model(nn.Module):
         return loaded_params
 
 
-class IQuestQ1ForCausalLM(nn.Module, SupportsPP):
+class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"mtp_layers.": None})
 
     packed_modules_mapping = {

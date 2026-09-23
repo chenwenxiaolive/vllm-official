@@ -153,9 +153,7 @@ class IQuestQ1MTPFirstLayer(IQuestQ1MTPLayer):
     """Compiled entry point for the structurally distinct first MTP layer."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(
-            vllm_config=vllm_config, prefix=prefix, use_sandwich_norm=True
-        )
+        super().__init__(vllm_config=vllm_config, prefix=prefix, use_sandwich_norm=True)
 
     def forward(
         self,
