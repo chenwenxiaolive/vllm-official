@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU checks for the IQuestQ1 draft head's checkpoint and residual contracts."""
 
-from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest

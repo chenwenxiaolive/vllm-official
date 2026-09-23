@@ -548,7 +548,9 @@ class IQuestQ1Model(nn.Module):
 
         self.use_oe_embedding = getattr(config, "use_over_encoding", False)
         if self.use_oe_embedding:
-            raise NotImplementedError("IQuestQ1 over-encoding embeddings are not supported")
+            raise NotImplementedError(
+                "IQuestQ1 over-encoding embeddings are not supported"
+            )
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
 
     def embed_input_ids(
