@@ -713,15 +713,14 @@ class SpeculativeConfig:
             )
 
         if hf_config.architectures[0] == "IQuestQ1ForCausalLM":
-            if getattr(hf_config, "num_mtp_layers", 0) < 1:
+            n_predict = getattr(hf_config, "num_mtp_layers", 0)
+            if n_predict < 1:
                 raise ValueError("IQuestQ1 MTP requires num_mtp_layers > 0")
-            # A checkpoint may ship several trained MTP heads; only the first
-            # one is served.
             hf_config.model_type = "iquest_q1_mtp"
             hf_config.update(
                 {
-                    "n_predict": 1,
-                    "num_nextn_predict_layers": 1,
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
                     "architectures": ["IQuestQ1MTP"],
                 }
             )

@@ -84,8 +84,8 @@ def test_mtp_config_counts_draft_layers_separately_from_backbone():
     assert draft.architectures == ["IQuestQ1MTP"]
     assert draft.model_type == "iquest_q1_mtp"
     assert draft.num_hidden_layers == 88
-    assert draft.n_predict == 1
-    assert draft.num_nextn_predict_layers == 1
+    assert draft.n_predict == 2
+    assert draft.num_nextn_predict_layers == 2
 
 
 @pytest.mark.cpu_test

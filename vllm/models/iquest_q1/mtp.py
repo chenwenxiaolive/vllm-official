@@ -39,13 +39,12 @@ def get_spec_layer_idx_from_name(weight_name: str) -> int:
 
 
 class IQuestQ1MTPInnerLayer(nn.Module):
-    """Decoder block of the served MTP head, which uses sandwich norms."""
-
     def __init__(
         self,
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
+        use_sandwich_norm: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -75,23 +74,37 @@ class IQuestQ1MTPInnerLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.ffn_out_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
-        self.ffn_out_scale = getattr(config, "first_layer_ffn_out_scale", 1.0)
+        self.use_sandwich_norm = use_sandwich_norm
+        if self.use_sandwich_norm:
+            self.ffn_out_norm = IQuestQ1RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps
+            )
+            self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
+            self.ffn_out_scale = getattr(config, "first_layer_ffn_out_scale", 1.0)
+        else:
+            self.attn_out_scale = getattr(config, "attn_out_scale", 1.0)
+            self.ffn_out_scale = getattr(config, "ffn_out_scale", 1.0)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        norm_hidden_states = self.attention_norm(hidden_states)
-        attn_output = self.self_attn(
-            positions=positions, hidden_states=norm_hidden_states
-        )
-        h = hidden_states + self.attn_out_norm(attn_output) * self.attn_out_scale
+        # Only the first MTP block keeps the unnormalized attention residual.
+        if self.use_sandwich_norm:
+            norm_hidden_states = self.attention_norm(hidden_states)
+            attn_output = self.self_attn(
+                positions=positions, hidden_states=norm_hidden_states
+            )
+            h = hidden_states + self.attn_out_norm(attn_output) * self.attn_out_scale
+            ffn_out = self.mlp(self.feed_forward_norm(h))
+            return h + self.ffn_out_norm(ffn_out) * self.ffn_out_scale
 
+        x = self.attention_norm(hidden_states)
+        attn_output = self.self_attn(positions=positions, hidden_states=x)
+        h = x + self.attn_out_norm(attn_output) * self.attn_out_scale
         ffn_out = self.mlp(self.feed_forward_norm(h))
-        return h + self.ffn_out_norm(ffn_out) * self.ffn_out_scale
+        return h + ffn_out * self.ffn_out_scale
 
 
 class IQuestQ1MTPLayer(nn.Module):
@@ -102,6 +115,7 @@ class IQuestQ1MTPLayer(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
+        use_sandwich_norm: bool = False,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -112,6 +126,7 @@ class IQuestQ1MTPLayer(nn.Module):
         self.mtp_model_layer = IQuestQ1MTPInnerLayer(
             vllm_config=vllm_config,
             prefix=f"{prefix}.mtp_model_layer",
+            use_sandwich_norm=use_sandwich_norm,
         )
         self.final_layernorm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -134,11 +149,31 @@ class IQuestQ1MTPLayer(nn.Module):
 
 
 @support_torch_compile
-class IQuestQ1MTPCompiledLayer(IQuestQ1MTPLayer):
-    """Compiled entry point for the served MTP layer."""
+class IQuestQ1MTPFirstLayer(IQuestQ1MTPLayer):
+    """Compiled entry point for the structurally distinct first MTP layer."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        super().__init__(
+            vllm_config=vllm_config, prefix=prefix, use_sandwich_norm=True
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        previous_hidden_states: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        return super().forward(positions, previous_hidden_states, inputs_embeds)
+
+
+@support_torch_compile
+class IQuestQ1MTPNextLayer(IQuestQ1MTPLayer):
+    """Compiled entry point shared by non-first MTP layer instances."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__(
+            vllm_config=vllm_config, prefix=prefix, use_sandwich_norm=False
+        )
 
     def forward(
         self,
@@ -154,23 +189,32 @@ class IQuestQ1MultiTokenPredictor(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.mtp_start_layer_idx = config.num_hidden_layers
+        self.num_mtp_layers = config.num_mtp_layers
 
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
-        # A checkpoint may ship several trained MTP heads; only the first one
-        # is served. The ModuleDict keeps the layer-indexed parameter names the
-        # checkpoint uses.
-        self.layers = nn.ModuleDict(
-            {
-                str(self.mtp_start_layer_idx): IQuestQ1MTPCompiledLayer(
+        from vllm.compilation.backends import set_model_tag
+
+        layers: dict[str, nn.Module] = {}
+        for idx in range(
+            self.mtp_start_layer_idx,
+            self.num_mtp_layers + self.mtp_start_layer_idx,
+        ):
+            relative_idx = idx - self.mtp_start_layer_idx
+            layer_cls = (
+                IQuestQ1MTPFirstLayer if relative_idx == 0 else IQuestQ1MTPNextLayer
+            )
+            # Each independently compiled MTP layer needs a distinct backend
+            # cache namespace. The outer draft model is tagged as eagle_head.
+            with set_model_tag(f"iquest_q1_mtp_layer_{relative_idx}"):
+                layers[str(idx)] = layer_cls(
                     vllm_config=vllm_config,
-                    prefix=f"{prefix}.layers.{self.mtp_start_layer_idx}",
+                    prefix=f"{prefix}.layers.{idx}",
                 )
-            }
-        )
+        self.layers = nn.ModuleDict(layers)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -188,7 +232,8 @@ class IQuestQ1MultiTokenPredictor(nn.Module):
                 "IQuestQ1 MTP requires input_ids when inputs_embeds is None"
             )
             inputs_embeds = self.embed_tokens(input_ids)
-        return self.layers[str(self.mtp_start_layer_idx)](
+        current_step_idx = spec_step_idx % self.num_mtp_layers
+        return self.layers[str(self.mtp_start_layer_idx + current_step_idx)](
             positions, previous_hidden_states, inputs_embeds
         )
 
@@ -277,12 +322,8 @@ class IQuestQ1MTP(nn.Module, SupportsPP):
             if not name.startswith(mtp_prefix):
                 continue
 
-            # Only the first trained MTP head is served.
+            # Rewrite mtp_layers.<i>.<rest> -> model.layers.<mtp_start + i>.<rest>
             spec_layer_idx = get_spec_layer_idx_from_name(name)
-            if spec_layer_idx != 0:
-                continue
-
-            # Rewrite mtp_layers.0.<rest> -> model.layers.<mtp_start>.<rest>
             name = name.replace(
                 f"mtp_layers.{spec_layer_idx}",
                 f"model.layers.{spec_layer_idx + self.mtp_start_layer_idx}",
