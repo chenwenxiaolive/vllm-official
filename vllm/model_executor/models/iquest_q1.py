@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only IQuest M1 model with hybrid attention and SonicMoE weights."""
+"""Inference-only IQuestQ1 model with hybrid attention and SonicMoE weights."""
 
 from collections.abc import Iterable
 from itertools import islice
@@ -101,7 +101,7 @@ def get_layer_sliding_window_size(
         return sliding_window_size
 
 
-class IquestMoeRMSNorm(nn.Module):
+class IQuestQ1RMSNorm(nn.Module):
     """RMSNorm (equivalent to T5LayerNorm)."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
@@ -121,8 +121,8 @@ class IquestMoeRMSNorm(nn.Module):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
-class IquestMoEBlock(nn.Module):
-    """M1 top-k softmax routing with tensor or expert parallel experts."""
+class IQuestQ1MoEBlock(nn.Module):
+    """IQuestQ1 top-k softmax routing with tensor or expert parallel experts."""
 
     def __init__(
         self,
@@ -167,7 +167,7 @@ class IquestMoEBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
-        # M1 computes router logits in FP32 and normalizes over selected experts.
+        # IQuestQ1 computes router logits in FP32 and normalizes over selected experts.
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
@@ -175,7 +175,7 @@ class IquestMoEBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-class IquestMoeV13DenseMLP(nn.Module):
+class IQuestQ1DenseMLP(nn.Module):
     """MLP for dense layers and optional shared expert (with optional gate)."""
 
     def __init__(
@@ -214,7 +214,7 @@ class IquestMoeV13DenseMLP(nn.Module):
         return out
 
 
-class IquestMoeAttention(nn.Module):
+class IQuestQ1Attention(nn.Module):
     def __init__(
         self,
         *,
@@ -266,7 +266,7 @@ class IquestMoeAttention(nn.Module):
         )
         self.tp_size = tp_size
         self.tp_rank = get_tensor_model_parallel_rank()
-        self.q_norm = IquestMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -345,9 +345,9 @@ class IquestMoeAttention(nn.Module):
                 self.cross_kv_cache = True
                 self.k_norm = None
             else:
-                self.k_norm = IquestMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+                self.k_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         else:
-            self.k_norm = IquestMoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
         # NOTE(yxing): sink tokens
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
@@ -355,14 +355,14 @@ class IquestMoeAttention(nn.Module):
         sink_args = {}
         if self.enable_sink_attention:
             from vllm.model_executor.layers.attention.iquest_attention import (
-                IquestAttention,
+                IQuestAttention,
             )
 
             self.sink_k = nn.Parameter(
                 torch.zeros(self.num_kv_heads, self.head_dim), requires_grad=False
             )
             set_weight_attrs(self.sink_k, {"weight_loader": self.sinks_k_weight_loader})
-            attn_cls = IquestAttention
+            attn_cls = IQuestAttention
             sink_args["sink_key"] = self.sink_k
 
         self.attn = attn_cls(
@@ -418,7 +418,7 @@ class IquestMoeAttention(nn.Module):
         return output
 
 
-class IquestMoeDecoderLayer(nn.Module):
+class IQuestQ1DecoderLayer(nn.Module):
     def __init__(
         self,
         *,
@@ -432,7 +432,7 @@ class IquestMoeDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = extract_layer_index(prefix)
 
-        self.self_attn = IquestMoeAttention(
+        self.self_attn = IQuestQ1Attention(
             vllm_config=vllm_config,
             prefix=f"{prefix}.self_attn",
         )
@@ -440,7 +440,7 @@ class IquestMoeDecoderLayer(nn.Module):
 
         mlp_only_layers = getattr(config, "mlp_only_layers", []) or []
         if self.layer_idx not in mlp_only_layers:
-            self.mlp = IquestMoEBlock(
+            self.mlp = IQuestQ1MoEBlock(
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_tok,
                 hidden_size=config.hidden_size,
@@ -449,7 +449,7 @@ class IquestMoeDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
         else:
-            self.mlp = IquestMoeV13DenseMLP(
+            self.mlp = IQuestQ1DenseMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.dense_intermediate_size,
                 hidden_act=config.hidden_act,
@@ -457,17 +457,17 @@ class IquestMoeDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.attention_norm = IquestMoeRMSNorm(
+        self.attention_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_out_norm = IquestMoeRMSNorm(
+        self.attn_out_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.feed_forward_norm = IquestMoeRMSNorm(
+        self.feed_forward_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         if self.use_sandwich_norm:
-            self.ffn_out_norm = IquestMoeRMSNorm(
+            self.ffn_out_norm = IQuestQ1RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
@@ -509,13 +509,13 @@ class IquestMoeDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class IquestMoeModel(nn.Module):
+class IQuestQ1Model(nn.Module):
     def __init__(
         self,
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        layer_type: type[nn.Module] = IquestMoeDecoderLayer,
+        layer_type: type[nn.Module] = IQuestQ1DecoderLayer,
     ):
         super().__init__()
 
@@ -539,7 +539,7 @@ class IquestMoeModel(nn.Module):
             prefix=f"{prefix}.layers",
         )
         if get_pp_group().is_last_rank:
-            self.norm = IquestMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
@@ -548,7 +548,7 @@ class IquestMoeModel(nn.Module):
 
         self.use_oe_embedding = getattr(config, "use_over_encoding", False)
         if self.use_oe_embedding:
-            raise NotImplementedError("M1 over-encoding embeddings are not supported")
+            raise NotImplementedError("IQuestQ1 over-encoding embeddings are not supported")
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
 
     def embed_input_ids(
@@ -764,7 +764,7 @@ class IquestMoeModel(nn.Module):
         return loaded_params
 
 
-class IquestMoeV13ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={"mtp_layers.": None})
 
     packed_modules_mapping = {
@@ -780,14 +780,14 @@ class IquestMoeV13ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        layer_type: type[nn.Module] = IquestMoeDecoderLayer,
+        layer_type: type[nn.Module] = IQuestQ1DecoderLayer,
     ):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = IquestMoeModel(
+        self.model = IQuestQ1Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             layer_type=layer_type,

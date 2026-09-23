@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU checks for the M1 draft head's checkpoint and residual contracts."""
+"""CPU checks for the IQuestQ1 draft head's checkpoint and residual contracts."""
 
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -10,7 +10,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm.model_executor.models import iquest_moe_v13_mtp as mtp
+from vllm.model_executor.models import iquest_q1_mtp as mtp
 
 
 class _Attention(nn.Module):
@@ -36,8 +36,8 @@ def tiny_config(monkeypatch):
         num_mtp_layers=2,
         vocab_size=8,
     )
-    monkeypatch.setattr(mtp, "IquestMoeAttention", lambda **kwargs: _Attention())
-    monkeypatch.setattr(mtp, "IquestMoEBlock", lambda **kwargs: nn.SiLU())
+    monkeypatch.setattr(mtp, "IQuestQ1Attention", lambda **kwargs: _Attention())
+    monkeypatch.setattr(mtp, "IQuestQ1MoEBlock", lambda **kwargs: nn.SiLU())
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=config), quant_config=None
     )
@@ -53,12 +53,12 @@ def _rms_norm(x, module):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_mtp_residual_and_scaling_match_training(tiny_config, first_layer, dtype):
     """Only the first MTP block retains the unnormalized attention residual."""
-    layer = mtp.IquestMoeV13MTPInnerLayer(
+    layer = mtp.IQuestQ1MTPInnerLayer(
         vllm_config=tiny_config, use_sandwich_norm=first_layer
     ).to(dtype=dtype)
     with torch.no_grad():
         for module in layer.modules():
-            if isinstance(module, mtp.IquestMoeRMSNorm):
+            if isinstance(module, mtp.IQuestQ1RMSNorm):
                 module.weight.copy_(torch.tensor([0.8, 1.1, 0.7, 1.3]))
     hidden = torch.tensor([[2.0, -1.0, 4.0, 0.5], [-3.0, 1.0, 0.5, 2.0]]).to(dtype)
     positions = torch.tensor([2, 7])
@@ -78,7 +78,7 @@ def test_mtp_residual_and_scaling_match_training(tiny_config, first_layer, dtype
 
 def test_mtp_masks_only_zero_position_embeddings(tiny_config):
     """The shifted BOS embedding is zeroed, while hidden states still contribute."""
-    layer = mtp.IquestMoeV13MTPLayer(vllm_config=tiny_config)
+    layer = mtp.IQuestQ1MTPLayer(vllm_config=tiny_config)
     with torch.no_grad():
         layer.eh_proj.weight.copy_(torch.cat([torch.eye(4), torch.eye(4)], dim=1))
     layer.mtp_model_layer = _Attention()
@@ -108,16 +108,16 @@ def test_mtp_steps_use_distinct_trained_layers(tiny_config, monkeypatch):
     )
     monkeypatch.setattr(
         mtp,
-        "IquestMoeV13MTPFirstLayer",
-        lambda **kwargs: mtp.IquestMoeV13MTPLayer(**kwargs, use_sandwich_norm=True),
+        "IQuestQ1MTPFirstLayer",
+        lambda **kwargs: mtp.IQuestQ1MTPLayer(**kwargs, use_sandwich_norm=True),
     )
     monkeypatch.setattr(
         mtp,
-        "IquestMoeV13MTPNextLayer",
-        lambda **kwargs: mtp.IquestMoeV13MTPLayer(**kwargs),
+        "IQuestQ1MTPNextLayer",
+        lambda **kwargs: mtp.IQuestQ1MTPLayer(**kwargs),
     )
     torch.manual_seed(0)
-    model = mtp.IquestMoeV13MultiTokenPredictor(vllm_config=tiny_config)
+    model = mtp.IQuestQ1MultiTokenPredictor(vllm_config=tiny_config)
     ids = torch.tensor([1, 3, 2])
     positions = torch.tensor([0, 1, 2])
     hidden = torch.randn(3, 4)
@@ -211,7 +211,7 @@ def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
     draft.config = SimpleNamespace(num_experts=2, intermediate_size=3)
     draft.mtp_start_layer_idx = 42
     draft.named_parameters = lambda: iter(params.items())
-    loaded = mtp.IquestMoeV13MTP.load_weights(draft, checkpoint)
+    loaded = mtp.IQuestQ1MTP.load_weights(draft, checkpoint)
 
     assert loaded == set(expected)
     for name, value in expected.items():
@@ -257,7 +257,7 @@ def test_mtp_proposer_chains_full_query_hidden_states(monkeypatch):
         _get_slot_mapping=lambda num_tokens, slots: slots,
         vllm_config=None,
     )
-    result = llm_base_proposer.SpecDecodeBaseProposer._propose_iquest_mtp_chained(
+    result = llm_base_proposer.SpecDecodeBaseProposer._propose_iquest_q1_mtp_chained(
         proposer,
         initial_hidden,
         initial_hidden[sample_indices],

@@ -640,7 +640,7 @@ class SpecDecodeBaseProposer:
             return draft_token_ids.view(-1, self.num_speculative_tokens)
 
         if self._iquest_multilayer_mtp:
-            return self._propose_iquest_mtp_chained(
+            return self._propose_iquest_q1_mtp_chained(
                 hidden_states,
                 sample_hidden_states,
                 token_indices_to_sample,
@@ -1631,7 +1631,7 @@ class SpecDecodeBaseProposer:
                 "(communication: O(2*tp_size) vs O(vocab_size))."
             )
 
-    def _propose_iquest_mtp_chained(
+    def _propose_iquest_q1_mtp_chained(
         self,
         hidden_states: torch.Tensor,
         sample_hidden_states: torch.Tensor,

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Reasoning parser for the iQuest Coder V2 chat template."""
+"""Reasoning parser for the IQuestQ1 chat template."""
 
 from collections.abc import Iterable, Sequence
 
@@ -11,7 +11,7 @@ from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tokenizers import TokenizerLike
 
 
-class IquestCoderV2ReasoningParser(ReasoningParser):
+class IQuestQ1ReasoningParser(ReasoningParser):
     """Extract reasoning from the current iQuest Coder assistant turn."""
 
     _START_TOKEN = "<think>"

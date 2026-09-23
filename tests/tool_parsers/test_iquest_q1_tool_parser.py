@@ -9,10 +9,10 @@ import pytest
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.abstract_parser import DelegatingParser
-from vllm.reasoning.iquest_coder_v2_reasoning_parser import (
-    IquestCoderV2ReasoningParser,
+from vllm.reasoning.iquest_q1_reasoning_parser import (
+    IQuestQ1ReasoningParser,
 )
-from vllm.tool_parsers.iquest_coder_v2_tool_parser import IquestCoderV2ToolParser
+from vllm.tool_parsers.iquest_q1_tool_parser import IQuestQ1ToolParser
 
 CALL_START = "<iquestcoder_tool_call>"
 CALL_END = "</iquestcoder_tool_call>"
@@ -91,7 +91,7 @@ def test_schema_string_values_preserved_across_request_types(tokenizer, request_
             }
             name = "agent__run"
         request = ResponsesRequest(model="m1", input="test", tools=[tool])
-    result = IquestCoderV2ToolParser(tokenizer).extract_tool_calls(
+    result = IQuestQ1ToolParser(tokenizer).extract_tool_calls(
         _call(name, text=" 123 \n", count="3", options='{"enabled":true}'), request
     )
     assert result.tools_called
@@ -108,7 +108,7 @@ def test_schema_string_values_preserved_across_request_types(tokenizer, request_
 def test_streaming_split_tags_preserve_parallel_calls_and_surrounding_content(
     tokenizer, chunk_size
 ):
-    parser = IquestCoderV2ToolParser(tokenizer)
+    parser = IQuestQ1ToolParser(tokenizer)
     text = "before" + _call(text="123") + "between" + _call() + "after"
     chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
     messages = list(_stream(parser, chunks, _request()))
@@ -134,7 +134,7 @@ def test_streaming_split_tags_preserve_parallel_calls_and_surrounding_content(
 @pytest.mark.parametrize("streaming", [False, True])
 def test_malformed_call_preserved_as_content(tokenizer, streaming):
     text = CALL_START + "run<arg_key>text</arg_key><arg_value>broken" + CALL_END
-    parser = IquestCoderV2ToolParser(tokenizer)
+    parser = IQuestQ1ToolParser(tokenizer)
     if streaming:
         results = list(_stream(parser, list(text), _request()))
         assert "".join(result.content or "" for result in results) == text
@@ -150,7 +150,7 @@ def test_disabled_tool_parsing_passes_xml_through(tokenizer, without_tools):
     request = _request("none")
     if without_tools:
         request.tools = None
-    parser = IquestCoderV2ToolParser(tokenizer)
+    parser = IQuestQ1ToolParser(tokenizer)
     assert parser.adjust_request(request).skip_special_tokens
     text = _call(text="123")
     assert parser.extract_tool_calls(text, request).content == text
@@ -161,8 +161,8 @@ def test_disabled_tool_parsing_passes_xml_through(tokenizer, without_tools):
 
 
 class _IquestParser(DelegatingParser):
-    reasoning_parser_cls = IquestCoderV2ReasoningParser
-    tool_parser_cls = IquestCoderV2ToolParser
+    reasoning_parser_cls = IQuestQ1ReasoningParser
+    tool_parser_cls = IQuestQ1ToolParser
 
 
 @pytest.mark.parametrize(

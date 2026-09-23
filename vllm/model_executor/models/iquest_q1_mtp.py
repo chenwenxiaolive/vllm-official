@@ -19,10 +19,10 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP
-from .iquest_moe_v13 import (
-    IquestMoeAttention,
-    IquestMoEBlock,
-    IquestMoeRMSNorm,
+from .iquest_q1 import (
+    IQuestQ1Attention,
+    IQuestQ1MoEBlock,
+    IQuestQ1RMSNorm,
 )
 from .utils import (
     is_pp_missing_parameter,
@@ -38,7 +38,7 @@ def get_spec_layer_idx_from_name(weight_name: str) -> int:
     return int(spec_layer_idx)
 
 
-class IquestMoeV13MTPInnerLayer(nn.Module):
+class IQuestQ1MTPInnerLayer(nn.Module):
     def __init__(
         self,
         *,
@@ -51,12 +51,12 @@ class IquestMoeV13MTPInnerLayer(nn.Module):
         quant_config = vllm_config.quant_config
         self.hidden_size = config.hidden_size
 
-        self.self_attn = IquestMoeAttention(
+        self.self_attn = IQuestQ1Attention(
             vllm_config=vllm_config,
             prefix=f"{prefix}.self_attn",
             is_mtp_layer=True,
         )
-        self.mlp = IquestMoEBlock(
+        self.mlp = IQuestQ1MoEBlock(
             num_experts=config.num_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
@@ -64,19 +64,19 @@ class IquestMoeV13MTPInnerLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.attention_norm = IquestMoeRMSNorm(
+        self.attention_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.attn_out_norm = IquestMoeRMSNorm(
+        self.attn_out_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.feed_forward_norm = IquestMoeRMSNorm(
+        self.feed_forward_norm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
         self.use_sandwich_norm = use_sandwich_norm
         if self.use_sandwich_norm:
-            self.ffn_out_norm = IquestMoeRMSNorm(
+            self.ffn_out_norm = IQuestQ1RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps
             )
             self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
@@ -114,7 +114,7 @@ class IquestMoeV13MTPInnerLayer(nn.Module):
             return output
 
 
-class IquestMoeV13MTPLayer(nn.Module):
+class IQuestQ1MTPLayer(nn.Module):
     """One MTP module: enorm/hnorm + eh_proj + inner decoder block + final LN."""
 
     def __init__(
@@ -127,15 +127,15 @@ class IquestMoeV13MTPLayer(nn.Module):
         super().__init__()
         config = vllm_config.model_config.hf_config
 
-        self.enorm = IquestMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = IquestMoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.mtp_model_layer = IquestMoeV13MTPInnerLayer(
+        self.mtp_model_layer = IQuestQ1MTPInnerLayer(
             vllm_config=vllm_config,
             prefix=f"{prefix}.mtp_model_layer",
             use_sandwich_norm=use_sandwich_norm,
         )
-        self.final_layernorm = IquestMoeRMSNorm(
+        self.final_layernorm = IQuestQ1RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -156,7 +156,7 @@ class IquestMoeV13MTPLayer(nn.Module):
 
 
 @support_torch_compile
-class IquestMoeV13MTPFirstLayer(IquestMoeV13MTPLayer):
+class IQuestQ1MTPFirstLayer(IQuestQ1MTPLayer):
     """Compiled entry point for the structurally distinct first MTP layer."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -176,7 +176,7 @@ class IquestMoeV13MTPFirstLayer(IquestMoeV13MTPLayer):
 
 
 @support_torch_compile
-class IquestMoeV13MTPNextLayer(IquestMoeV13MTPLayer):
+class IQuestQ1MTPNextLayer(IQuestQ1MTPLayer):
     """Compiled entry point shared by non-first MTP layer instances."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -195,7 +195,7 @@ class IquestMoeV13MTPNextLayer(IquestMoeV13MTPLayer):
         return super().forward(positions, previous_hidden_states, inputs_embeds)
 
 
-class IquestMoeV13MultiTokenPredictor(nn.Module):
+class IQuestQ1MultiTokenPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -216,13 +216,13 @@ class IquestMoeV13MultiTokenPredictor(nn.Module):
         ):
             relative_idx = idx - self.mtp_start_layer_idx
             layer_cls = (
-                IquestMoeV13MTPFirstLayer
+                IQuestQ1MTPFirstLayer
                 if relative_idx == 0
-                else IquestMoeV13MTPNextLayer
+                else IQuestQ1MTPNextLayer
             )
             # Each independently compiled MTP layer needs a distinct backend
             # cache namespace. The outer draft model is tagged as eagle_head.
-            with set_model_tag(f"iquest_mtp_layer_{relative_idx}"):
+            with set_model_tag(f"iquest_q1_mtp_layer_{relative_idx}"):
                 layers[str(idx)] = layer_cls(
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.layers.{idx}",
@@ -258,7 +258,7 @@ class IquestMoeV13MultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             assert input_ids is not None, (
-                "IquestMoeV13 MTP requires input_ids when inputs_embeds is None"
+                "IQuestQ1 MTP requires input_ids when inputs_embeds is None"
             )
             inputs_embeds = self.embed_tokens(input_ids)
         current_step_idx = spec_step_idx % self.num_mtp_layers
@@ -268,8 +268,8 @@ class IquestMoeV13MultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class IquestMoeV13MTP(nn.Module, SupportsPP):
-    """Draft head for IquestMoeV13.
+class IQuestQ1MTP(nn.Module, SupportsPP):
+    """Draft head for IQuestQ1.
 
     The whole draft head resides on the last pipeline stage.
     """
@@ -287,7 +287,7 @@ class IquestMoeV13MTP(nn.Module, SupportsPP):
         super().__init__()
         self.config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
-        self.model = IquestMoeV13MultiTokenPredictor(
+        self.model = IQuestQ1MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         self.lm_head = ParallelLMHead(

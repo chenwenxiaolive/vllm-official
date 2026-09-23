@@ -42,7 +42,7 @@ def _build_processor(vocab_size: int) -> LogitsProcessor:
     return lp
 
 
-@pytest.mark.parametrize("model_type", ["iquest_moe_v1_3", "iquest_mtp", "llama"])
+@pytest.mark.parametrize("model_type", ["iquest_q1", "iquest_q1_mtp", "llama"])
 @pytest.mark.parametrize("override", [None, "model", "float32"])
 def test_m1_head_default_respects_explicit_overrides(monkeypatch, model_type, override):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
@@ -54,7 +54,7 @@ def test_m1_head_default_respects_explicit_overrides(monkeypatch, model_type, ov
     assert warning.called is automatic
 
 
-@pytest.mark.parametrize("model_type", ["iquest_moe_v1_3", "iquest_mtp"])
+@pytest.mark.parametrize("model_type", ["iquest_q1", "iquest_q1_mtp"])
 def test_m1_head_default_preserves_batch_invariant_path(monkeypatch, model_type):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     config = SimpleNamespace(model_type=model_type)
@@ -67,7 +67,7 @@ def test_m1_fp32_logits_preserve_ranking_lost_to_bf16(default_vllm_config, monke
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "0")
     lp = _build_processor(2)
     lp.head_dtype = _get_head_dtype(
-        SimpleNamespace(model_type="iquest_moe_v1_3"), torch.bfloat16, "generate"
+        SimpleNamespace(model_type="iquest_q1"), torch.bfloat16, "generate"
     )
     hidden = torch.ones(1, 2, dtype=torch.bfloat16)
     weight = torch.tensor([[1000, 0], [1000, 1]], dtype=torch.bfloat16)

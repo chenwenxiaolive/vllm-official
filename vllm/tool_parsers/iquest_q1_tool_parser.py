@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tool parser for the iQuest Coder V2 chat template."""
+"""Tool parser for the IQuestQ1 chat template."""
 
 import json
 from collections.abc import Sequence
@@ -22,8 +22,8 @@ from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.utils import Tool, iter_response_function_tool_info
 
 
-class IquestCoderV2ToolParser(ToolParser):
-    """Parse iQuest Coder V2 XML tool calls."""
+class IQuestQ1ToolParser(ToolParser):
+    """Parse IQuestQ1 XML tool calls."""
 
     supports_required_and_named = False
 

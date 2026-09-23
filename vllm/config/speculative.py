@@ -65,7 +65,7 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
     "inkling_mtp",
     "glm5_next_mtp",
-    "iquest_mtp",
+    "iquest_q1_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -713,16 +713,16 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]}
             )
 
-        if hf_config.architectures[0] == "IquestMoeV13ForCausalLM":
+        if hf_config.architectures[0] == "IQuestQ1ForCausalLM":
             n_predict = getattr(hf_config, "num_mtp_layers", 0)
             if n_predict < 1:
                 raise ValueError("Iquest MTP requires num_mtp_layers > 0")
-            hf_config.model_type = "iquest_mtp"
+            hf_config.model_type = "iquest_q1_mtp"
             hf_config.update(
                 {
                     "n_predict": n_predict,
                     "num_nextn_predict_layers": n_predict,
-                    "architectures": ["IquestMoeV13MTPModel"],
+                    "architectures": ["IQuestQ1MTP"],
                 }
             )
 
@@ -1994,7 +1994,7 @@ class SpeculativeConfig:
             return False
         hf_config = self.draft_model_config.hf_config
         return (
-            hf_config.model_type == "iquest_mtp"
+            hf_config.model_type == "iquest_q1_mtp"
             and envs.VLLM_IQUEST_MULTILAYER_MTP
             and getattr(hf_config, "num_mtp_layers", 1) > 1
             and self.num_speculative_tokens == hf_config.num_mtp_layers
@@ -2003,7 +2003,7 @@ class SpeculativeConfig:
     def use_multi_module_mtp(self) -> bool:
         if self.method != "mtp" or self.draft_model_config is None:
             return False
-        if self.draft_model_config.hf_config.model_type == "iquest_mtp":
+        if self.draft_model_config.hf_config.model_type == "iquest_q1_mtp":
             return self.use_iquest_multilayer_mtp()
         num_mtp_layers = getattr(
             self.draft_model_config.hf_config, "num_nextn_predict_layers", 1

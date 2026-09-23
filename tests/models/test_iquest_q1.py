@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""M1 hybrid configuration, routing precision, and checkpoint layout tests."""
+"""IQuestQ1 hybrid configuration, routing precision, and checkpoint layout tests."""
 
 from types import SimpleNamespace
 
@@ -9,16 +9,16 @@ import torch
 from torch import nn
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.model_executor.models.iquest_moe_v13 import (
-    IquestMoeAttention,
-    IquestMoEBlock,
-    IquestMoeModel,
-    IquestMoeRMSNorm,
-    IquestMoeV13ForCausalLM,
+from vllm.model_executor.models.iquest_q1 import (
+    IQuestQ1Attention,
+    IQuestQ1MoEBlock,
+    IQuestQ1Model,
+    IQuestQ1RMSNorm,
+    IQuestQ1ForCausalLM,
     get_layer_sliding_window_size,
 )
 from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.configs.iquest_moe_v13 import IquestMoeV13Config
+from vllm.transformers_utils.configs.iquest_q1 import IQuestQ1Config
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )
@@ -26,7 +26,7 @@ from vllm.transformers_utils.model_arch_config_convertor import (
 
 @pytest.mark.cpu_test
 def test_hybrid_config_roundtrip_preserves_global_and_windowed_layers(tmp_path):
-    config = IquestMoeV13Config(architectures=["IquestMoeV13ForCausalLM"])
+    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
     config.save_pretrained(tmp_path)
     loaded = get_config(str(tmp_path), trust_remote_code=False)
     assert loaded.layer_types == (
@@ -53,7 +53,7 @@ def test_hybrid_config_roundtrip_preserves_global_and_windowed_layers(tmp_path):
     [(0, None), (1, None), (2, 4096), (84, 4096), (85, None), (87, None)],
 )
 def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
-    config = IquestMoeV13Config()
+    config = IQuestQ1Config()
     assert (
         get_layer_sliding_window_size(
             config.first_layers_types,
@@ -81,12 +81,12 @@ def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
 
 @pytest.mark.cpu_test
 def test_mtp_config_counts_draft_layers_separately_from_backbone():
-    config = IquestMoeV13Config(architectures=["IquestMoeV13ForCausalLM"])
+    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
     draft = SpeculativeConfig.hf_config_override(config)
-    assert draft.architectures == ["IquestMoeV13MTPModel"]
+    assert draft.architectures == ["IQuestQ1MTP"]
     assert draft.num_hidden_layers == 88
     assert draft.num_nextn_predict_layers == 2
-    converter = MODEL_ARCH_CONFIG_CONVERTORS["iquest_mtp"](draft, draft)
+    converter = MODEL_ARCH_CONFIG_CONVERTORS["iquest_q1_mtp"](draft, draft)
     assert converter.get_num_hidden_layers() == 2
 
 
@@ -98,7 +98,7 @@ def test_multilayer_mtp_requires_enabled_matching_draft_depth(
     monkeypatch, enabled, steps, expected
 ):
     monkeypatch.setenv("VLLM_IQUEST_MULTILAYER_MTP", enabled)
-    config = IquestMoeV13Config(architectures=["IquestMoeV13ForCausalLM"])
+    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
     draft = SpeculativeConfig.hf_config_override(config)
     speculative = SpeculativeConfig.__new__(SpeculativeConfig)
     speculative.method = "mtp"
@@ -111,13 +111,13 @@ def test_multilayer_mtp_requires_enabled_matching_draft_depth(
 @pytest.mark.cpu_test
 def test_invalid_hybrid_pattern_fails_before_weight_loading():
     with pytest.raises(ValueError, match="hybrid layer pattern"):
-        IquestMoeV13Config(num_hidden_layers=87)
+        IQuestQ1Config(num_hidden_layers=87)
 
 
 @pytest.mark.cpu_test
 def test_rms_norm_multiplies_weight_before_casting_to_activation_dtype():
     generator = torch.Generator().manual_seed(42)
-    norm = IquestMoeRMSNorm(128).to(dtype=torch.bfloat16)
+    norm = IQuestQ1RMSNorm(128).to(dtype=torch.bfloat16)
     with torch.no_grad():
         norm.weight.copy_(torch.randn(128, generator=generator))
     x = torch.randn(7, 128, generator=generator).to(torch.bfloat16)
@@ -130,7 +130,7 @@ def test_rms_norm_multiplies_weight_before_casting_to_activation_dtype():
 
 @pytest.mark.cpu_test
 def test_router_keeps_fp32_logits_and_bf16_expert_activations():
-    block = IquestMoEBlock.__new__(IquestMoEBlock)
+    block = IQuestQ1MoEBlock.__new__(IQuestQ1MoEBlock)
     nn.Module.__init__(block)
     captured = {}
 
@@ -169,14 +169,14 @@ def test_sink_weights_follow_kv_head_sharding_and_replication(tp_size, kv_heads)
             num_kv_heads=local_heads,
         )
         param = nn.Parameter(torch.empty(local_heads, 4), requires_grad=False)
-        IquestMoeAttention.sinks_k_weight_loader(attention, param, weight)
+        IQuestQ1Attention.sinks_k_weight_loader(attention, param, weight)
         first_head = rank * kv_heads // tp_size
         torch.testing.assert_close(param, weight[first_head : first_head + local_heads])
 
 
 @pytest.mark.cpu_test
 def test_base_weight_loader_loads_backbone_and_head_but_skips_mtp():
-    model = IquestMoeV13ForCausalLM.__new__(IquestMoeV13ForCausalLM)
+    model = IQuestQ1ForCausalLM.__new__(IQuestQ1ForCausalLM)
     nn.Module.__init__(model)
     model.model = nn.Linear(2, 2, bias=False)
     model.lm_head = nn.Linear(2, 3, bias=False)
@@ -198,7 +198,7 @@ def test_base_weight_loader_loads_backbone_and_head_but_skips_mtp():
 
 @pytest.mark.cpu_test
 def test_sonic_expert_checkpoint_splits_gate_up_and_maps_down_weights():
-    model = IquestMoeModel.__new__(IquestMoeModel)
+    model = IQuestQ1Model.__new__(IQuestQ1Model)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=2, intermediate_size=3)
     model.use_oe_embedding = False

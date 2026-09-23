@@ -4,10 +4,10 @@
 from transformers.configuration_utils import PretrainedConfig
 
 
-class IquestMoeV13Config(PretrainedConfig):
-    """Configuration for IQuest M1's hybrid attention and MoE layers."""
+class IQuestQ1Config(PretrainedConfig):
+    """Configuration for IQuestQ1's hybrid attention and MoE layers."""
 
-    model_type = "iquest_moe_v1_3"
+    model_type = "iquest_q1"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -100,14 +100,14 @@ class IquestMoeV13Config(PretrainedConfig):
             )
             if len(layer_types) != num_hidden_layers:
                 raise ValueError(
-                    "M1 hybrid layer pattern has "
+                    "IQuestQ1 hybrid layer pattern has "
                     f"{len(layer_types)} layers, expected {num_hidden_layers}"
                 )
             if any(
                 t not in ("full_attention", "sliding_attention") for t in layer_types
             ):
                 raise ValueError(
-                    "M1 supports full_attention and sliding_attention layers"
+                    "IQuestQ1 supports full_attention and sliding_attention layers"
                 )
         else:
             layer_types = ["full_attention"] * num_hidden_layers
@@ -142,4 +142,4 @@ class IquestMoeV13Config(PretrainedConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
-__all__ = ["IquestMoeV13Config"]
+__all__ = ["IQuestQ1Config"]

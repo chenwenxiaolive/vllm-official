@@ -5,8 +5,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from vllm.reasoning.iquest_coder_v2_reasoning_parser import (
-    IquestCoderV2ReasoningParser,
+from vllm.reasoning.iquest_q1_reasoning_parser import (
+    IQuestQ1ReasoningParser,
 )
 
 START = 100
@@ -41,7 +41,7 @@ def tokenizer():
     ],
 )
 def test_implicit_or_explicit_reasoning_start(tokenizer, output, expected):
-    parser = IquestCoderV2ReasoningParser(tokenizer)
+    parser = IQuestQ1ReasoningParser(tokenizer)
     assert parser.extract_reasoning(output, request=None) == expected
 
 
@@ -55,8 +55,8 @@ def test_implicit_or_explicit_reasoning_start(tokenizer, output, expected):
     ],
 )
 def test_thinking_flag_matches_checkpoint_template(tokenizer, chat_kwargs, enabled):
-    """The M1 template uses enable_thinking; thinking is not its flag."""
-    parser = IquestCoderV2ReasoningParser(tokenizer, chat_template_kwargs=chat_kwargs)
+    """The IQuestQ1 template uses enable_thinking; thinking is not its flag."""
+    parser = IQuestQ1ReasoningParser(tokenizer, chat_template_kwargs=chat_kwargs)
     output = "reasoning</think>answer"
     expected = ("reasoning", "answer") if enabled else (None, output)
     assert parser.extract_reasoning(output, request=None) == expected
@@ -76,13 +76,13 @@ def test_thinking_flag_matches_checkpoint_template(tokenizer, chat_kwargs, enabl
     ],
 )
 def test_previous_turn_cannot_end_current_reasoning(tokenizer, tokens, ended, content):
-    parser = IquestCoderV2ReasoningParser(tokenizer)
+    parser = IQuestQ1ReasoningParser(tokenizer)
     assert parser.is_reasoning_end(tokens) is ended
     assert parser.extract_content_ids(tokens) == content
 
 
 def test_mtp_delta_contains_reasoning_end_and_content(tokenizer):
-    parser = IquestCoderV2ReasoningParser(tokenizer)
+    parser = IQuestQ1ReasoningParser(tokenizer)
     chunks = [
         ("<think>", [START]),
         ("first ", [1]),
@@ -107,7 +107,7 @@ def test_mtp_delta_contains_reasoning_end_and_content(tokenizer):
 
 
 def test_disabled_thinking_emits_content_from_first_token(tokenizer):
-    parser = IquestCoderV2ReasoningParser(
+    parser = IQuestQ1ReasoningParser(
         tokenizer, chat_template_kwargs={"enable_thinking": False}
     )
     result = parser.extract_reasoning_streaming("", "answer", "answer", [], [1], [1])
@@ -124,7 +124,7 @@ def test_adaptive_thinking_stream_routes_tool_call_to_content(tokenizer, single_
     vocab = tokenizer.get_vocab()
     if not single_token:
         del vocab["<iquestcoder_tool_call>"]
-    parser = IquestCoderV2ReasoningParser(Mock(get_vocab=lambda: vocab))
+    parser = IQuestQ1ReasoningParser(Mock(get_vocab=lambda: vocab))
     text = '<iquestcoder_tool_call>{"name":"search"'
     ids = [TOOL, 1] if single_token else [4, 5, 6]
     first = parser.extract_reasoning_streaming("", text, text, [], ids, ids)
@@ -148,4 +148,4 @@ def test_missing_template_token_rejected(tokenizer, missing):
     vocab = tokenizer.get_vocab()
     del vocab[missing]
     with pytest.raises(ValueError, match="missing required"):
-        IquestCoderV2ReasoningParser(Mock(get_vocab=lambda: vocab))
+        IQuestQ1ReasoningParser(Mock(get_vocab=lambda: vocab))

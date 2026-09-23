@@ -50,7 +50,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "HYV4Config": "vllm.transformers_utils.configs.hy_v4",
     "HyperCLOVAXConfig": "vllm.transformers_utils.configs.hyperclovax",
     "IsaacConfig": "vllm.transformers_utils.configs.isaac",
-    "IquestMoeV13Config": "vllm.transformers_utils.configs.iquest_moe_v13",
+    "IQuestQ1Config": "vllm.transformers_utils.configs.iquest_q1",
     # RWConfig is for the original tiiuae/falcon-40b(-instruct) and
     # tiiuae/falcon-7b(-instruct) models. Newer Falcon models will use the
     # `FalconConfig` class from the official HuggingFace transformers library.
@@ -147,7 +147,7 @@ __all__ = [
     "HYV3Config",
     "HYV4Config",
     "HyperCLOVAXConfig",
-    "IquestMoeV13Config",
+    "IQuestQ1Config",
     "IsaacConfig",
     "RWConfig",
     "Lfm2MoeConfig",

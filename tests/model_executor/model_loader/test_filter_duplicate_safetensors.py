@@ -15,7 +15,7 @@ from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.weight_utils import (
     filter_duplicate_safetensors_files,
 )
-from vllm.model_executor.models.iquest_moe_v13_mtp import IquestMoeV13MTP
+from vllm.model_executor.models.iquest_q1_mtp import IQuestQ1MTP
 
 
 def test_filter_duplicate_safetensors_files_missing_weight():
@@ -106,7 +106,7 @@ def test_loader_prunes_only_unneeded_mtp_shards(tmp_path, mode):
     model = torch.nn.Module()
     if mode != "no_filter":
         model.safetensors_weights_filter = (
-            IquestMoeV13MTP.safetensors_weights_filter
+            IQuestQ1MTP.safetensors_weights_filter
             if mode != "no_match"
             else lambda name: False
         )

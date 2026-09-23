@@ -62,7 +62,7 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
     from types import SimpleNamespace
 
     from vllm.model_executor.layers.attention.iquest_attention import (
-        IquestFlashAttentionImpl,
+        IQuestFlashAttentionImpl,
     )
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
@@ -98,7 +98,7 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         prefix_kv_lens=None,
         suffix_kv_lens=None,
     )
-    impl = IquestFlashAttentionImpl(
+    impl = IQuestFlashAttentionImpl(
         num_q_heads, head_size, scale, num_kv_heads, None, sliding_window, "auto"
     )
     impl.vllm_flash_attn_version = fa_version

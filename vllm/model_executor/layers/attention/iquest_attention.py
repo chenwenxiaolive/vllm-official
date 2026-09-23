@@ -109,7 +109,7 @@ def apply_sink_key(
     )
 
 
-class IquestFlashAttentionMetadataBuilder(fa.FlashAttentionMetadataBuilder):
+class IQuestFlashAttentionMetadataBuilder(fa.FlashAttentionMetadataBuilder):
     def use_cascade_attention(self, *args: Any, **kwargs: Any) -> bool:
         return False
 
@@ -119,7 +119,7 @@ class IquestFlashAttentionMetadataBuilder(fa.FlashAttentionMetadataBuilder):
         return super().build(0, *args, **kwargs)
 
 
-class IquestFlashAttentionBackend(fa.FlashAttentionBackend):
+class IQuestFlashAttentionBackend(fa.FlashAttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
@@ -127,15 +127,15 @@ class IquestFlashAttentionBackend(fa.FlashAttentionBackend):
     ]
 
     @staticmethod
-    def get_impl_cls() -> type["IquestFlashAttentionImpl"]:
-        return IquestFlashAttentionImpl
+    def get_impl_cls() -> type["IQuestFlashAttentionImpl"]:
+        return IQuestFlashAttentionImpl
 
     @staticmethod
-    def get_builder_cls() -> type[IquestFlashAttentionMetadataBuilder]:
-        return IquestFlashAttentionMetadataBuilder
+    def get_builder_cls() -> type[IQuestFlashAttentionMetadataBuilder]:
+        return IQuestFlashAttentionMetadataBuilder
 
 
-class IquestFlashAttentionImpl(fa.FlashAttentionImpl):
+class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
     supports_dcp = False
     can_return_lse_for_decode = False
 
@@ -229,11 +229,11 @@ class IquestFlashAttentionImpl(fa.FlashAttentionImpl):
         return output
 
 
-class IquestAttention(Attention):
+class IQuestAttention(Attention):
     """Attention with a learned sink key owned by the parent model layer."""
 
     def __init__(self, *args: Any, sink_key: torch.Tensor, **kwargs: Any) -> None:
-        kwargs["attn_backend"] = IquestFlashAttentionBackend
+        kwargs["attn_backend"] = IQuestFlashAttentionBackend
         super().__init__(*args, **kwargs)
         if self.head_size_v != self.head_size:
             raise NotImplementedError(
