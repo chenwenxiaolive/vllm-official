@@ -5,7 +5,6 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -38,7 +37,6 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         )
 
         self.inputs_embeds: torch.Tensor | None = None
-        self.mtp_inputs_embeds: torch.Tensor | None = None
 
         # Input id overrides for the last num_speculative_steps - 1 draft steps.
         # Used by chunked-prefilling requests to swap in the future prefill token
@@ -80,9 +78,6 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
 
     def load_model(self, target_model: nn.Module) -> None:
         super().load_model(target_model)
-        if getattr(self.model, "supports_mtp_piecewise_cudagraphs", False):
-            # Fixed per-layer compiled entry points require stable input addresses.
-            self.mtp_inputs_embeds = torch.zeros_like(self.hidden_states)
         if not self.supports_mm_inputs:
             return
 
@@ -101,11 +96,8 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        supports_piecewise = (
-            getattr(self.model, "supports_mtp_piecewise_cudagraphs", False)
-            and not is_breakable_cudagraph_enabled()
-        )
-        if cudagraph_mode.has_piecewise_cudagraphs() and not supports_piecewise:
+        # TODO(TheEpicDolphin): Support piecewise cudagraph for multi-module MTP.
+        if cudagraph_mode.has_piecewise_cudagraphs():
             cudagraph_mode = (
                 CUDAGraphMode.FULL_DECODE_ONLY
                 if cudagraph_mode.has_full_cudagraphs()
@@ -292,14 +284,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
                 ),
                 spec_step_idx=spec_module_idx,
             )
-            if self.mtp_inputs_embeds is not None:
-                self.mtp_inputs_embeds[:num_tokens] = self.model.embed_input_ids(
-                    self.input_buffers.input_ids[:num_tokens]
-                )
-                model_inputs["input_ids"] = None
-                model_inputs["inputs_embeds"] = self.mtp_inputs_embeds[:num_tokens]
-                ret_hidden_states = self.model.forward_mtp_layer(**model_inputs)
-            elif cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+            if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
                 # PIECEWISE cudagraph (compiled PW or breakable), chosen inside
                 # run_pw_graph.
                 assert self.cudagraph_manager is not None

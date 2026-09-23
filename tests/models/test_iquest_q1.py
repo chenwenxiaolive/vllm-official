@@ -85,27 +85,9 @@ def test_mtp_config_counts_draft_layers_separately_from_backbone():
     draft = SpeculativeConfig.hf_config_override(config)
     assert draft.architectures == ["IQuestQ1MTP"]
     assert draft.num_hidden_layers == 88
-    assert draft.num_nextn_predict_layers == 2
+    assert draft.num_nextn_predict_layers == 1
     converter = MODEL_ARCH_CONFIG_CONVERTORS["iquest_q1_mtp"](draft, draft)
-    assert converter.get_num_hidden_layers() == 2
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "enabled,steps,expected", [("1", 2, True), ("0", 2, False), ("1", 1, False)]
-)
-def test_multilayer_mtp_requires_enabled_matching_draft_depth(
-    monkeypatch, enabled, steps, expected
-):
-    monkeypatch.setenv("VLLM_IQUEST_MULTILAYER_MTP", enabled)
-    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
-    draft = SpeculativeConfig.hf_config_override(config)
-    speculative = SpeculativeConfig.__new__(SpeculativeConfig)
-    speculative.method = "mtp"
-    speculative.draft_model_config = SimpleNamespace(hf_config=draft)
-    speculative.num_speculative_tokens = steps
-    assert speculative.use_iquest_multilayer_mtp() is expected
-    assert speculative.use_multi_module_mtp() is expected
+    assert converter.get_num_hidden_layers() == 1
 
 
 @pytest.mark.cpu_test

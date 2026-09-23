@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
-from vllm import envs
 from vllm.config import LoadConfig
 from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
@@ -714,14 +713,15 @@ class SpeculativeConfig:
             )
 
         if hf_config.architectures[0] == "IQuestQ1ForCausalLM":
-            n_predict = getattr(hf_config, "num_mtp_layers", 0)
-            if n_predict < 1:
-                raise ValueError("Iquest MTP requires num_mtp_layers > 0")
+            if getattr(hf_config, "num_mtp_layers", 0) < 1:
+                raise ValueError("IQuestQ1 MTP requires num_mtp_layers > 0")
+            # A checkpoint may ship several trained MTP heads; only the first
+            # one is served.
             hf_config.model_type = "iquest_q1_mtp"
             hf_config.update(
                 {
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
+                    "n_predict": 1,
+                    "num_nextn_predict_layers": 1,
                     "architectures": ["IQuestQ1MTP"],
                 }
             )
@@ -1382,7 +1382,6 @@ class SpeculativeConfig:
                         )
                     if (
                         self.num_speculative_tokens > 1
-                        and not self.use_iquest_multilayer_mtp()
                         and self.draft_model_config.hf_config.model_type
                         not in ("step3p5_mtp", "inkling_mtp")
                     ):
@@ -1989,22 +1988,9 @@ class SpeculativeConfig:
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
 
-    def use_iquest_multilayer_mtp(self) -> bool:
-        if self.method != "mtp" or self.draft_model_config is None:
-            return False
-        hf_config = self.draft_model_config.hf_config
-        return (
-            hf_config.model_type == "iquest_q1_mtp"
-            and envs.VLLM_IQUEST_MULTILAYER_MTP
-            and getattr(hf_config, "num_mtp_layers", 1) > 1
-            and self.num_speculative_tokens == hf_config.num_mtp_layers
-        )
-
     def use_multi_module_mtp(self) -> bool:
         if self.method != "mtp" or self.draft_model_config is None:
             return False
-        if self.draft_model_config.hf_config.model_type == "iquest_q1_mtp":
-            return self.use_iquest_multilayer_mtp()
         num_mtp_layers = getattr(
             self.draft_model_config.hf_config, "num_nextn_predict_layers", 1
         )
