@@ -18,13 +18,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
-from .interfaces import SupportsPP
-from .iquest_q1 import (
+from vllm.model_executor.models.interfaces import SupportsPP
+from .model import (
     IQuestQ1Attention,
     IQuestQ1MoEBlock,
     IQuestQ1RMSNorm,
 )
-from .utils import (
+from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
@@ -199,13 +199,6 @@ class IQuestQ1MTP(nn.Module, SupportsPP):
 
     The whole draft head resides on the last pipeline stage.
     """
-
-    @staticmethod
-    def safetensors_weights_filter(weight_name: str) -> bool:
-        return weight_name.startswith("mtp_layers.0.") or weight_name in (
-            "model.embed_tokens.weight",
-            "lm_head.weight",
-        )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

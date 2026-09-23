@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm.model_executor.models import iquest_q1_mtp as mtp
+from vllm.models.iquest_q1 import mtp
 
 
 class _Attention(nn.Module):

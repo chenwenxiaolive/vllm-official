@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.model_executor.models.iquest_q1 import (
+from vllm.models.iquest_q1.model import (
     IQuestQ1Attention,
     IQuestQ1ForCausalLM,
     IQuestQ1Model,
@@ -18,7 +18,7 @@ from vllm.model_executor.models.iquest_q1 import (
     get_layer_sliding_window_size,
 )
 from vllm.transformers_utils.config import get_config
-from vllm.transformers_utils.configs.iquest_q1 import IQuestQ1Config
+from vllm.models.iquest_q1.configs import IQuestQ1Config
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )

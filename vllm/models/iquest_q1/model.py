@@ -53,8 +53,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (
+from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
+from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
@@ -354,9 +354,7 @@ class IQuestQ1Attention(nn.Module):
         attn_cls: type[nn.Module] = Attention
         sink_args = {}
         if self.enable_sink_attention:
-            from vllm.model_executor.layers.attention.iquest_attention import (
-                IQuestAttention,
-            )
+            from .attention import IQuestAttention
 
             self.sink_k = nn.Parameter(
                 torch.zeros(self.num_kv_heads, self.head_dim), requires_grad=False

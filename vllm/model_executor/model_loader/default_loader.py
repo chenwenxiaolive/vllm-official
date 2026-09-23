@@ -4,7 +4,7 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Generator, Iterable
 from typing import cast
 
 import torch
@@ -25,7 +25,6 @@ from vllm.model_executor.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
-    filter_safetensors_files_by_weight_name,
     get_quant_config,
     instanttensor_weights_iterator,
     maybe_download_from_modelscope,
@@ -68,9 +67,6 @@ class DefaultModelLoader(BaseModelLoader):
 
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
-
-        safetensors_weights_filter: Callable[[str], bool] | None = None
-        """Optional weight-name predicate used to select indexed shards."""
 
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
@@ -136,7 +132,6 @@ class DefaultModelLoader(BaseModelLoader):
         revision: str | None,
         fall_back_to_pt: bool,
         allow_patterns_overrides: list[str] | None,
-        safetensors_weights_filter: Callable[[str], bool] | None = None,
     ) -> tuple[str, list[str], bool]:
         """Prepare weights for the model.
 
@@ -236,13 +231,6 @@ class DefaultModelLoader(BaseModelLoader):
             hf_weights_files = filter_duplicate_safetensors_files(
                 hf_weights_files, hf_folder, index_file
             )
-            if safetensors_weights_filter is not None:
-                hf_weights_files = filter_safetensors_files_by_weight_name(
-                    hf_weights_files,
-                    hf_folder,
-                    index_file,
-                    safetensors_weights_filter,
-                )
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
@@ -264,7 +252,6 @@ class DefaultModelLoader(BaseModelLoader):
             source.revision,
             source.fall_back_to_pt,
             source.allow_patterns_overrides,
-            source.safetensors_weights_filter,
         )
         if self.load_config.load_format == "npcache":
             # Currently np_cache only support *.bin checkpoints
@@ -342,9 +329,6 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-            safetensors_weights_filter=getattr(
-                model, "safetensors_weights_filter", None
-            ),
         )
         yield from self._get_weights_iterator(primary_weights)
 
