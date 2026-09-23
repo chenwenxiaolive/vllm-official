@@ -135,4 +135,3 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         )
         start += query_len
     assert torch.all(output[num_tokens:] == -73)
-

@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from vllm.config.speculative import SpeculativeConfig
+from vllm.models.iquest_q1.configs import IQuestQ1Config
 from vllm.models.iquest_q1.model import (
     IQuestQ1Attention,
     IQuestQ1ForCausalLM,
@@ -18,10 +19,6 @@ from vllm.models.iquest_q1.model import (
     get_layer_sliding_window_size,
 )
 from vllm.transformers_utils.config import get_config
-from vllm.models.iquest_q1.configs import IQuestQ1Config
-from vllm.transformers_utils.model_arch_config_convertor import (
-    MODEL_ARCH_CONFIG_CONVERTORS,
-)
 
 
 @pytest.mark.cpu_test
@@ -81,13 +78,14 @@ def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
 
 @pytest.mark.cpu_test
 def test_mtp_config_counts_draft_layers_separately_from_backbone():
+    """The draft keeps the backbone depth, which offsets its layer names."""
     config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
     draft = SpeculativeConfig.hf_config_override(config)
     assert draft.architectures == ["IQuestQ1MTP"]
+    assert draft.model_type == "iquest_q1_mtp"
     assert draft.num_hidden_layers == 88
+    assert draft.n_predict == 1
     assert draft.num_nextn_predict_layers == 1
-    converter = MODEL_ARCH_CONFIG_CONVERTORS["iquest_q1_mtp"](draft, draft)
-    assert converter.get_num_hidden_layers() == 1
 
 
 @pytest.mark.cpu_test

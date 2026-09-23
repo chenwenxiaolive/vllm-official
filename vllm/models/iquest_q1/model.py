@@ -48,21 +48,20 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.utils import extract_layer_index
-from vllm.model_executor.utils import set_weight_attrs
-from vllm.sequence import IntermediateTensors
-from vllm.v1.attention.backend import AttentionType
-
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     WeightsMapper,
+    extract_layer_index,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
+from vllm.model_executor.utils import set_weight_attrs
+from vllm.sequence import IntermediateTensors
+from vllm.v1.attention.backend import AttentionType
 
 logger = init_logger(__name__)
 

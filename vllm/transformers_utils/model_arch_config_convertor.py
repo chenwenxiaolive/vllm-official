@@ -824,7 +824,6 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "gemma4_unified_text": Gemma4ModelArchConfigConvertor,
     "glm4_moe_mtp": GLM4MoeMTPModelArchConfigConvertor,
     "glm_ocr_mtp": GLM4MoeMTPModelArchConfigConvertor,
-    "iquest_q1_mtp": DeepSeekMTPModelArchConfigConvertor,
     "longcat_flash_mtp": LongCatFlashMTPModelArchConfigConvertor,
     "mamba": MambaModelArchConfigConvertor,
     "medusa": MedusaModelArchConfigConvertor,
