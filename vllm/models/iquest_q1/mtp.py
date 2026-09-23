@@ -236,11 +236,16 @@ class IQuestQ1MultiTokenPredictor(nn.Module):
         )
 
 
-@support_torch_compile
 class IQuestQ1MTP(nn.Module, SupportsPP):
     """Draft head for IQuestQ1.
 
     The whole draft head resides on the last pipeline stage.
+
+    This wrapper is deliberately not wrapped in ``support_torch_compile``:
+    ``forward`` dispatches on ``spec_step_idx``, and a compiled wrapper
+    specializes on that int, so every speculative step would replay the graph
+    captured for step 0 and the later MTP heads would never run. Each layer in
+    ``IQuestQ1MultiTokenPredictor`` carries its own decorator instead.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
