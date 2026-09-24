@@ -188,7 +188,7 @@ def test_base_weight_loader_loads_backbone_and_head_but_skips_mtp():
 
 
 @pytest.mark.cpu_test
-def test_sonic_expert_checkpoint_splits_gate_up_and_maps_down_weights():
+def test_expert_checkpoint_splits_gate_up_and_maps_down_weights():
     model = IQuestQ1Model.__new__(IQuestQ1Model)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(num_experts=2, intermediate_size=3)

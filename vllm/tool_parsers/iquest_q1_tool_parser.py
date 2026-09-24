@@ -27,8 +27,8 @@ class IQuestQ1ToolParser(ToolParser):
 
     supports_required_and_named = False
 
-    _CALL_START = "<iquestcoder_tool_call>"
-    _CALL_END = "</iquestcoder_tool_call>"
+    _CALL_START = "<iquest_tool_call>"
+    _CALL_END = "</iquest_tool_call>"
     _KEY_START = "<arg_key>"
     _KEY_END = "</arg_key>"
     _VALUE_START = "<arg_value>"
@@ -37,7 +37,7 @@ class IQuestQ1ToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
         if not tokenizer:
-            raise ValueError("A tokenizer is required for iQuest Coder tool parsing")
+            raise ValueError("A tokenizer is required for IQuestQ1 tool parsing")
         missing_tokens = [
             token
             for token in (self._CALL_START, self._CALL_END)
@@ -45,7 +45,7 @@ class IQuestQ1ToolParser(ToolParser):
         ]
         if missing_tokens:
             raise ValueError(
-                "Tokenizer is missing required iQuest Coder tokens: "
+                "Tokenizer is missing required IQuestQ1 tokens: "
                 + ", ".join(missing_tokens)
             )
         self._stream_buffer = ""

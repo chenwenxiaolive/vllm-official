@@ -16,7 +16,7 @@ class IQuestQ1ReasoningParser(ReasoningParser):
 
     _START_TOKEN = "<think>"
     _END_TOKEN = "</think>"
-    _ASSISTANT_TOKEN = "<|iquestcoder_assistant|>"
+    _ASSISTANT_TOKEN = "<|iquest_assistant|>"
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs):
         super().__init__(tokenizer, *args, **kwargs)

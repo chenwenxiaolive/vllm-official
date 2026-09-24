@@ -21,8 +21,8 @@ def tokenizer():
         get_vocab=lambda: {
             "<think>": START,
             "</think>": END,
-            "<|iquestcoder_assistant|>": ASSISTANT,
-            "<iquestcoder_tool_call>": TOOL,
+            "<|iquest_assistant|>": ASSISTANT,
+            "<iquest_tool_call>": TOOL,
         }
     )
 
@@ -118,9 +118,7 @@ def test_disabled_thinking_emits_content_from_first_token(tokenizer):
     assert parser.count_reasoning_tokens([1, 2]) == 0
 
 
-@pytest.mark.parametrize(
-    "missing", ["<think>", "</think>", "<|iquestcoder_assistant|>"]
-)
+@pytest.mark.parametrize("missing", ["<think>", "</think>", "<|iquest_assistant|>"])
 def test_missing_template_token_rejected(tokenizer, missing):
     vocab = tokenizer.get_vocab()
     del vocab[missing]

@@ -14,8 +14,8 @@ from vllm.reasoning.iquest_q1_reasoning_parser import (
 )
 from vllm.tool_parsers.iquest_q1_tool_parser import IQuestQ1ToolParser
 
-CALL_START = "<iquestcoder_tool_call>"
-CALL_END = "</iquestcoder_tool_call>"
+CALL_START = "<iquest_tool_call>"
+CALL_END = "</iquest_tool_call>"
 PARAMETERS = {
     "type": "object",
     "properties": {
@@ -32,7 +32,7 @@ def tokenizer():
         get_vocab=lambda: {
             "<think>": 100,
             "</think>": 101,
-            "<|iquestcoder_assistant|>": 102,
+            "<|iquest_assistant|>": 102,
             CALL_START: 103,
             CALL_END: 104,
         }
