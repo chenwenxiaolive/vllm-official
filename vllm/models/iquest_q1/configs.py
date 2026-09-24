@@ -21,7 +21,7 @@ class IQuestQ1Config(PretrainedConfig):
         num_key_value_heads: int = 8,
         head_dim: int = 128,
         hidden_act: str = "silu",
-        max_position_embeddings: int = 262144,
+        max_position_embeddings: int = 524288,
         rms_norm_eps: float = 1e-6,
         num_experts: int = 256,
         num_experts_per_tok: int = 8,

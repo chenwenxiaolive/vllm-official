@@ -26,6 +26,7 @@ def test_hybrid_config_roundtrip_preserves_global_and_windowed_layers(tmp_path):
     config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
     config.save_pretrained(tmp_path)
     loaded = get_config(str(tmp_path), trust_remote_code=False)
+    assert loaded.max_position_embeddings == 524288
     assert loaded.layer_types == (
         ["full_attention"]
         + [
