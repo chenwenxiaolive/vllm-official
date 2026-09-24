@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only IQuestQ1 model with hybrid attention and SonicMoE weights."""
+"""Inference-only IQuestQ1 model with hybrid attention."""
 
 from collections.abc import Iterable
 from itertools import islice
@@ -669,10 +669,7 @@ class IQuestQ1Model(nn.Module):
                         continue
 
                     if "experts.fc" in name:
-                        # NOTE(yxing): for sonic moe model
-                        # experts.fc -> experts.w13_.
-                        # the shape of experts.fc is
-                        #   [experts, 2 * intermediate_size, hidden_size]
+                        # Shape: [experts, 2 * intermediate_size, hidden_size].
                         name = name.replace(
                             "experts.fc", "experts.routed_experts.w13_weight"
                         )
@@ -707,10 +704,7 @@ class IQuestQ1Model(nn.Module):
                         continue
 
                     if "experts.proj" in name:
-                        # NOTE(yxing): for sonic moe model
-                        # experts.proj -> experts.w2_w2.
-                        # the shape of experts.proj is
-                        #       [experts, hidden_size, intermediate_size]
+                        # Shape: [experts, hidden_size, intermediate_size].
                         name = name.replace(
                             "experts.proj", "experts.routed_experts.w2_weight"
                         )
@@ -748,9 +742,6 @@ class IQuestQ1Model(nn.Module):
                         else:
                             name = remapped_kv_scale_name
 
-                    # NOTE(yxing): for sonic moe model, the router name is:
-                    #    layers.0.mlp.router.weight. We need to convert it to
-                    #    layers.0.mlp.gate.weight
                     if "router.weight" in name:
                         name = name.replace("router.weight", "gate.weight")
 

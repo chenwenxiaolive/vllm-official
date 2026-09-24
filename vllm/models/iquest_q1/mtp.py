@@ -288,8 +288,6 @@ class IQuestQ1MTP(nn.Module, SupportsPP):
                 if expert_weight_matched:
                     continue
 
-                # Sonic-MoE fused expert tensors: match exact ".experts.fc" /
-                # ".experts.proj" component suffixes.
                 if name.endswith(".mlp.experts.fc"):
                     mapped = name[: -len(".fc")] + ".routed_experts.w13_weight"
                     param = params_dict[mapped]
@@ -330,7 +328,6 @@ class IQuestQ1MTP(nn.Module, SupportsPP):
                     logger.warning_once("sink attention feature is disabled")
                     continue
 
-                # Sonic-MoE router naming: ".mlp.router.weight" -> ".mlp.gate.weight".
                 if name.endswith(".mlp.router.weight"):
                     name = name[: -len(".router.weight")] + ".gate.weight"
 
