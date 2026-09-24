@@ -283,7 +283,6 @@ class IQuestQ1Attention(nn.Module):
         if rope_theta:
             rope_parameters["rope_theta"] = rope_theta
 
-        # NOTE(yxing): setup hybrid attention for model
         layer_idx = extract_layer_index(prefix)
         use_hybrid_layers = getattr(config, "use_hybrid_layers", False)
         real_sliding_window = None
@@ -305,8 +304,6 @@ class IQuestQ1Attention(nn.Module):
             if real_sliding_window:
                 rope_parameters["rope_theta"] = config.swa_rope_theta
 
-        # NOTE(yxing): check no_rope_layers. Now the full attention use no_rope
-        # and sliding window use rope
         no_rope_layers = getattr(config, "no_rope_layers", [])
         current_layer_no_rope = layer_idx in no_rope_layers
 
@@ -321,7 +318,6 @@ class IQuestQ1Attention(nn.Module):
             else None
         )
 
-        # NOTE(yxing): check shared kv cache
         self.shared_kv_num_layers = config.shared_kv_num_layers
         kv_sharing_target_layer_name = None
         self.cross_kv_cache = False
@@ -348,7 +344,6 @@ class IQuestQ1Attention(nn.Module):
         else:
             self.k_norm = IQuestQ1RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # NOTE(yxing): sink tokens
         self.enable_sink_attention = getattr(config, "enable_sink_attention", False)
         attn_cls: type[nn.Module] = Attention
         sink_args = {}
@@ -407,7 +402,6 @@ class IQuestQ1Attention(nn.Module):
             k_by_head = self.k_norm(k_by_head)
             k = k_by_head.view(k.shape)
 
-            # NOTE(yxing): check rotary_embed whether exists or not
             if self.rotary_emb:
                 q, k = self.rotary_emb(positions, q, k)
             attn_output = self.attn(q, k, v)
@@ -468,7 +462,6 @@ class IQuestQ1DecoderLayer(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps
             )
 
-        # NOTE(yxing): add scale config
         if self.layer_idx == 0:
             self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
             self.ffn_out_scale = getattr(config, "first_layer_ffn_out_scale", 1.0)
@@ -482,7 +475,6 @@ class IQuestQ1DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         # Self Attention
-        # NOTE(yxing): post-norm is different for first layer and non-first layers
         if self.use_sandwich_norm:
             norm_hidden_states = self.attention_norm(hidden_states)
             attn_output = self.self_attn(
@@ -611,10 +603,6 @@ class IQuestQ1Model(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
-        # NOTE(yxing): for each expert, it includes
-        # ('experts.w13_', 'experts.layer_idx.gate_proj.', expert_idx, 'w1'),
-        # ('experts.w2_', 'experts.layer_idx.down_proj.', expert_idx, 'w2'),
-        # ('experts.w13_', 'experts.layer_idx.up_proj.', expert_idx, 'w3')
         for name, loaded_weight in weights:
             if is_pp_missing_parameter(name, self):
                 continue
