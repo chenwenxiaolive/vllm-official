@@ -719,8 +719,8 @@ class SpeculativeConfig:
             hf_config.model_type = "iquest_q1_mtp"
             hf_config.update(
                 {
-                    "n_predict": n_predict,
-                    "num_nextn_predict_layers": n_predict,
+                    "n_predict": 1,
+                    "num_nextn_predict_layers": 1,
                     "architectures": ["IQuestQ1MTP"],
                 }
             )

@@ -77,15 +77,25 @@ def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
 
 
 @pytest.mark.cpu_test
-def test_mtp_config_counts_draft_layers_separately_from_backbone():
-    """The draft keeps the backbone depth, which offsets its layer names."""
-    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"])
+@pytest.mark.parametrize("num_mtp_layers", [1, 2])
+def test_mtp_config_serves_one_draft_layer(num_mtp_layers):
+    """The checkpoint depth is preserved while multi-module dispatch is disabled."""
+    config = IQuestQ1Config(
+        architectures=["IQuestQ1ForCausalLM"], num_mtp_layers=num_mtp_layers
+    )
     draft = SpeculativeConfig.hf_config_override(config)
     assert draft.architectures == ["IQuestQ1MTP"]
     assert draft.model_type == "iquest_q1_mtp"
     assert draft.num_hidden_layers == 88
-    assert draft.n_predict == 2
-    assert draft.num_nextn_predict_layers == 2
+    assert draft.num_mtp_layers == num_mtp_layers
+    assert draft.n_predict == 1
+    assert draft.num_nextn_predict_layers == 1
+    spec = SimpleNamespace(
+        method="mtp",
+        draft_model_config=SimpleNamespace(hf_config=draft),
+        num_speculative_tokens=2,
+    )
+    assert not SpeculativeConfig.use_multi_module_mtp(spec)
 
 
 @pytest.mark.cpu_test

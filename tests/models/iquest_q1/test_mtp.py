@@ -48,13 +48,10 @@ def _rms_norm(x, module):
     ).to(x.dtype)
 
 
-@pytest.mark.parametrize("first_layer", [True, False])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_mtp_residual_and_scaling_match_training(tiny_config, first_layer, dtype):
-    """Only the first MTP block retains the unnormalized attention residual."""
-    layer = mtp.IQuestQ1MTPInnerLayer(
-        vllm_config=tiny_config, use_sandwich_norm=first_layer
-    ).to(dtype=dtype)
+def test_mtp_residual_and_scaling_match_training(tiny_config, dtype):
+    """The served head retains the unnormalized residual and both output norms."""
+    layer = mtp.IQuestQ1MTPInnerLayer(vllm_config=tiny_config).to(dtype=dtype)
     with torch.no_grad():
         for module in layer.modules():
             if isinstance(module, mtp.IQuestQ1RMSNorm):
@@ -63,14 +60,11 @@ def test_mtp_residual_and_scaling_match_training(tiny_config, first_layer, dtype
     positions = torch.tensor([2, 7])
     normalized = _rms_norm(hidden, layer.attention_norm)
     attn_output = layer.self_attn(positions, normalized)
-    residual = hidden if first_layer else normalized
-    residual = residual + _rms_norm(attn_output, layer.attn_out_norm) * (
-        0.7 if first_layer else 1.3
+    residual = hidden + _rms_norm(attn_output, layer.attn_out_norm) * 0.7
+    ffn_output = _rms_norm(
+        F.silu(_rms_norm(residual, layer.feed_forward_norm)), layer.ffn_out_norm
     )
-    ffn_output = F.silu(_rms_norm(residual, layer.feed_forward_norm))
-    if first_layer:
-        ffn_output = _rms_norm(ffn_output, layer.ffn_out_norm)
-    expected = residual + ffn_output * (0.4 if first_layer else 1.7)
+    expected = residual + ffn_output * 0.4
 
     torch.testing.assert_close(layer(positions, hidden), expected)
 
@@ -98,22 +92,12 @@ def test_mtp_masks_only_zero_position_embeddings(tiny_config):
     assert torch.count_nonzero(expected[0]) == 4
 
 
-def test_mtp_steps_use_distinct_trained_layers(tiny_config, monkeypatch):
-    """A later draft consumes the preceding head's states and its own parameters."""
+def test_mtp_steps_reuse_first_trained_layer(tiny_config, monkeypatch):
+    """A two-head checkpoint still uses only its first head for every draft step."""
     monkeypatch.setattr(
         mtp,
         "VocabParallelEmbedding",
         lambda vocab_size, hidden_size, **kwargs: nn.Embedding(vocab_size, hidden_size),
-    )
-    monkeypatch.setattr(
-        mtp,
-        "IQuestQ1MTPFirstLayer",
-        lambda **kwargs: mtp.IQuestQ1MTPLayer(**kwargs, use_sandwich_norm=True),
-    )
-    monkeypatch.setattr(
-        mtp,
-        "IQuestQ1MTPNextLayer",
-        lambda **kwargs: mtp.IQuestQ1MTPLayer(**kwargs),
     )
     torch.manual_seed(0)
     model = mtp.IQuestQ1MultiTokenPredictor(vllm_config=tiny_config)
@@ -124,20 +108,20 @@ def test_mtp_steps_use_distinct_trained_layers(tiny_config, monkeypatch):
     first = model(ids, positions, hidden, spec_step_idx=0)
     second = model(None, positions, first, embeds, spec_step_idx=1)
 
+    assert list(model.layers) == ["42"]
     torch.testing.assert_close(first, model.layers["42"](positions, hidden, embeds))
-    torch.testing.assert_close(second, model.layers["43"](positions, first, embeds))
-    assert not torch.allclose(second, model.layers["42"](positions, first, embeds))
-    assert not torch.allclose(second, model.layers["43"](positions, hidden, embeds))
+    torch.testing.assert_close(second, model.layers["42"](positions, first, embeds))
+    assert not torch.allclose(second, first)
 
 
 @pytest.mark.parametrize("fused_experts", [False, True])
 def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
-    """MTP checkpoint layer IDs are relative; expert and QKV shards must not mix."""
+    """Only the first head loads, with correct offsets and expert/QKV shards."""
     params = {}
     checkpoint = []
     expected = {}
 
-    def add_parameter(name, value, loader=None):
+    def add_served_parameter(name, value, loader=None):
         param = nn.Parameter(torch.zeros_like(value), requires_grad=False)
         if loader is not None:
             param.weight_loader = loader
@@ -155,9 +139,10 @@ def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
 
     for name in ("model.embed_tokens.weight", "lm_head.weight"):
         value = torch.arange(32, dtype=torch.float32).reshape(8, 4)
-        add_parameter(name, value)
+        add_served_parameter(name, value)
         checkpoint.append((name, value))
     for idx in range(2):
+        add_parameter = add_served_parameter if idx == 0 else lambda *a, **k: None
         src = f"mtp_layers.{idx}"
         dst = f"model.layers.{42 + idx}"
         qkv = torch.arange(48, dtype=torch.float32).reshape(3, 4, 4) + idx * 100
