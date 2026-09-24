@@ -39,6 +39,8 @@ class IQuestQ1MTPInnerLayer(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
+        draft_sliding_window: int | None = None,
+        draft_rope_theta: float | None = None,
     ) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -49,6 +51,8 @@ class IQuestQ1MTPInnerLayer(nn.Module):
             vllm_config=vllm_config,
             prefix=f"{prefix}.self_attn",
             is_mtp_layer=True,
+            draft_sliding_window=draft_sliding_window,
+            draft_rope_theta=draft_rope_theta,
         )
         self.mlp = IQuestQ1MoEBlock(
             num_experts=config.num_experts,

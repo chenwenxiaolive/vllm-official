@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from vllm.models.iquest_q1 import mtp
+from vllm.models.iquest_q1 import mtp, mtp_recursive
 
 
 class _Attention(nn.Module):
@@ -34,6 +34,9 @@ def tiny_config(monkeypatch):
         num_hidden_layers=42,
         num_mtp_layers=2,
         vocab_size=8,
+        sliding_window=512,
+        swa_rope_theta=10000.0,
+        fp32_residual_connection=True,
     )
     monkeypatch.setattr(mtp, "IQuestQ1Attention", lambda **kwargs: _Attention())
     monkeypatch.setattr(mtp, "IQuestQ1MoEBlock", lambda **kwargs: nn.SiLU())
@@ -115,7 +118,8 @@ def test_mtp_steps_reuse_first_trained_layer(tiny_config, monkeypatch):
 
 
 @pytest.mark.parametrize("fused_experts", [False, True])
-def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
+@pytest.mark.parametrize("recursive", [False, True])
+def test_mtp_loads_offset_layers_and_fused_weights(fused_experts, recursive):
     """Only the first head loads, with correct offsets and expert/QKV shards."""
     params = {}
     checkpoint = []
@@ -140,10 +144,11 @@ def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
     for name in ("model.embed_tokens.weight", "lm_head.weight"):
         value = torch.arange(32, dtype=torch.float32).reshape(8, 4)
         add_served_parameter(name, value)
-        checkpoint.append((name, value))
-    for idx in range(2):
+        source_name = name.removeprefix("model.") if recursive else name
+        checkpoint.append((source_name, value))
+    for idx in range(1 if recursive else 2):
         add_parameter = add_served_parameter if idx == 0 else lambda *a, **k: None
-        src = f"mtp_layers.{idx}"
+        src = "mtp" if recursive else f"mtp_layers.{idx}"
         dst = f"model.layers.{42 + idx}"
         qkv = torch.arange(48, dtype=torch.float32).reshape(3, 4, 4) + idx * 100
         add_parameter(
@@ -190,13 +195,62 @@ def test_mtp_loads_offset_layers_and_fused_weights(fused_experts):
         add_parameter(f"{dst}.final_layernorm.weight", norm)
         checkpoint.append((f"{src}.final_layernorm.weight", norm))
 
-    checkpoint.append(("model.layers.0.self_attn.q_proj.weight", torch.ones(4, 4)))
+    if recursive:
+        checkpoint.append(("target_final_norm.weight", torch.ones(4)))
+    else:
+        checkpoint.append(("model.layers.0.self_attn.q_proj.weight", torch.ones(4, 4)))
     draft = nn.Module()
     draft.config = SimpleNamespace(num_experts=2, intermediate_size=3)
     draft.mtp_start_layer_idx = 42
     draft.named_parameters = lambda: iter(params.items())
-    loaded = mtp.IQuestQ1MTP.load_weights(draft, checkpoint)
+    model_cls = mtp_recursive.IQuestQ1MTPRecursive if recursive else mtp.IQuestQ1MTP
+    loaded = model_cls.load_weights(draft, checkpoint)
 
     assert loaded == set(expected)
     for name, value in expected.items():
         torch.testing.assert_close(params[name], value, msg=name)
+
+    if recursive:
+        with pytest.raises(ValueError, match="missing weights"):
+            model_cls.load_weights(draft, checkpoint[1:])
+        with pytest.raises(ValueError, match="missing QKV"):
+            model_cls.load_weights(
+                draft,
+                [
+                    (name, weight)
+                    for name, weight in checkpoint
+                    if ".q_proj." not in name
+                ],
+            )
+
+
+@pytest.mark.parametrize("fp32_residual", [False, True])
+def test_recursive_mtp_keeps_bos_embedding_and_residual_precision(
+    tiny_config, fp32_residual
+):
+    """A recursive step consumes real shifted tokens, including at position zero."""
+    tiny_config.model_config.hf_config.fp32_residual_connection = fp32_residual
+    torch.manual_seed(7)
+    layer = mtp_recursive.IQuestQ1RecursiveLayer(vllm_config=tiny_config).bfloat16()
+    positions = torch.tensor([0, 511, 512])
+    hidden = torch.randn(3, 4, dtype=torch.bfloat16)
+    embeds = torch.randn(3, 4, dtype=torch.bfloat16)
+    projected = F.linear(
+        torch.cat([_rms_norm(embeds, layer.enorm), _rms_norm(hidden, layer.hnorm)], -1),
+        layer.eh_proj.weight,
+    )
+    inner = layer.mtp_model_layer
+    attention = inner.self_attn(positions, _rms_norm(projected, inner.attention_norm))
+    residual = projected.float() if fp32_residual else projected
+    residual = residual + _rms_norm(attention, inner.attn_out_norm) * 0.7
+    ffn = F.silu(_rms_norm(residual, inner.feed_forward_norm).bfloat16())
+    expected = _rms_norm(
+        residual + _rms_norm(ffn, inner.ffn_out_norm) * 0.4,
+        layer.final_layernorm,
+    ).bfloat16()
+    actual = layer(positions, hidden, embeds)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.bfloat16
+    zeroed = embeds.clone()
+    zeroed[0] = 0
+    assert not torch.equal(actual[0], layer(positions, hidden, zeroed)[0])

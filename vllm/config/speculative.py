@@ -70,7 +70,12 @@ NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
 DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "mtp_recursive",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -659,6 +664,8 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        if hf_config.model_type == "mtp_strict_draft":
+            hf_config.architectures = ["IQuestQ1MTPRecursive"]
         initial_architecture = hf_config.architectures[0]
         use_v32_mtp = hf_config.model_type in ("deepseek_v32", "glm_moe_dsa")
         if hf_config.model_type == "dots3_note":
@@ -1330,7 +1337,13 @@ class SpeculativeConfig:
                         draft_hf.truncated_vocab_size = target_vocab
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                if self.method in (
+                    "eagle",
+                    "eagle3",
+                    "mtp_recursive",
+                    "dflash",
+                    "dspark",
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -1483,6 +1496,36 @@ class SpeculativeConfig:
                         and getattr(hf, "block_size", None) is not None
                     ):
                         hf.n_predict = hf.block_size
+
+                if self.method == "mtp_recursive":
+                    draft_hf = self.draft_model_config.hf_config
+                    target_hf = self.target_model_config.hf_config
+                    if (
+                        draft_hf.model_type != "mtp_strict_draft"
+                        or target_hf.model_type != "iquest_q1"
+                    ):
+                        raise ValueError(
+                            "mtp_recursive requires an IQuestQ1 target and "
+                            "mtp_strict_draft checkpoint"
+                        )
+                    if self.parallel_drafting:
+                        raise ValueError("mtp_recursive requires serial drafting")
+                    if (
+                        draft_hf.hidden_size != target_hf.hidden_size
+                        or draft_hf.vocab_size != target_hf.vocab_size
+                    ):
+                        raise ValueError(
+                            "Recursive draft hidden size and vocabulary "
+                            "must match the target"
+                        )
+                    if self.num_speculative_tokens is None:
+                        self.num_speculative_tokens = draft_hf.num_draft_slots
+                    elif self.num_speculative_tokens > draft_hf.num_draft_slots:
+                        logger.warning(
+                            "Recursive MTP depth exceeds the checkpoint's "
+                            "trained num_draft_slots=%d",
+                            draft_hf.num_draft_slots,
+                        )
 
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
@@ -1956,7 +1999,14 @@ class SpeculativeConfig:
         # NOTE: This method is usually a stand-in for "speculative decoding using
         # target model hidden states"
         # TODO(ben): Refactor this so the naming is clearer
-        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+        return self.method in (
+            "eagle",
+            "eagle3",
+            "mtp",
+            "mtp_recursive",
+            "dflash",
+            "dspark",
+        )
 
     def use_eagle_block_drop(self) -> bool:
         """Whether volatile trailing cache blocks should be discarded."""

@@ -9,7 +9,8 @@ import torch
 from torch import nn
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.models.iquest_q1.configs import IQuestQ1Config
+from vllm.models.iquest_q1 import model as iquest_model
+from vllm.models.iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
 from vllm.models.iquest_q1.model import (
     IQuestQ1Attention,
     IQuestQ1ForCausalLM,
@@ -19,6 +20,88 @@ from vllm.models.iquest_q1.model import (
     get_layer_sliding_window_size,
 )
 from vllm.transformers_utils.config import get_config
+
+
+@pytest.mark.cpu_test
+def test_recursive_draft_preserves_own_attention_config(tmp_path):
+    target = IQuestQ1Config()
+    config = IQuestQ1MTPRecursiveConfig(
+        target_config=target.to_dict(),
+        architectures=["MtpStrictModel"],
+        sliding_window=512,
+        swa_rope_theta=10000.0,
+        num_draft_slots=7,
+        fp32_residual_connection=True,
+    )
+    config.save_pretrained(tmp_path)
+    loaded = get_config(str(tmp_path), trust_remote_code=False)
+    assert loaded.num_hidden_layers == 1
+    assert loaded.layer_types == ["sliding_attention"]
+    assert loaded.sliding_window == 512
+    assert loaded.swa_rope_theta == 10000.0
+    assert loaded.fp32_residual_connection
+    assert loaded.target_config["num_hidden_layers"] == 88
+    assert loaded.target_config["sliding_window"] == 4096
+    assert loaded.num_draft_slots == 7
+    assert SpeculativeConfig.hf_config_override(loaded).architectures == [
+        "IQuestQ1MTPRecursive"
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"draft_type": "diffusion"},
+        {"dense_ffn": True},
+        {"eagle3_shared_kv": True},
+        {"dflash_num_layers": 2},
+        {"sliding_window": 512},
+        {"num_draft_slots": 0},
+    ],
+)
+def test_recursive_config_rejects_unsupported_drafts(kwargs):
+    with pytest.raises(ValueError):
+        IQuestQ1MTPRecursiveConfig(**kwargs)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("window", [None, 512])
+def test_recursive_attention_uses_draft_window_and_rope(monkeypatch, window):
+    """A draft layer after the target must retain its own window and RoPE base."""
+    observed = {}
+
+    def attention(*args, **kwargs):
+        observed["window"] = kwargs["per_layer_sliding_window"]
+        return nn.Identity()
+
+    def rope(*args, **kwargs):
+        observed["theta"] = kwargs["rope_parameters"]["rope_theta"]
+        return nn.Identity()
+
+    monkeypatch.setattr(iquest_model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(iquest_model, "get_tensor_model_parallel_rank", lambda: 0)
+    for name in ("QKVParallelLinear", "RowParallelLinear"):
+        monkeypatch.setattr(iquest_model, name, lambda *a, **kw: nn.Identity())
+    monkeypatch.setattr(iquest_model, "Attention", attention)
+    monkeypatch.setattr(iquest_model, "get_rope", rope)
+    config = IQuestQ1MTPRecursiveConfig(
+        target_config=IQuestQ1Config(enable_sink_attention=False).to_dict(),
+        sliding_window=window,
+        swa_rope_theta=10000.0,
+    )
+    IQuestQ1Attention(
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config),
+            cache_config=None,
+            quant_config=None,
+        ),
+        prefix="draft.layers.88.self_attn",
+        is_mtp_layer=True,
+        draft_sliding_window=window,
+        draft_rope_theta=10000.0 if window else None,
+    )
+    assert observed == {"window": window, "theta": 10000.0 if window else 1000000.0}
 
 
 @pytest.mark.cpu_test

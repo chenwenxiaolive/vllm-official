@@ -142,4 +142,59 @@ class IQuestQ1Config(PretrainedConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
-__all__ = ["IQuestQ1Config"]
+class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
+    """Standalone recursive draft with its own attention configuration."""
+
+    model_type = "mtp_strict_draft"
+
+    def __init__(
+        self,
+        target_config: dict | None = None,
+        num_draft_slots: int = 7,
+        sliding_window: int | None = None,
+        swa_rope_theta: float | None = None,
+        fp32_residual_connection: bool = False,
+        draft_type: str = "eagle3",
+        **kwargs,
+    ):
+        if draft_type != "eagle3":
+            raise ValueError("Recursive MTP requires draft_type='eagle3'")
+        if kwargs.get("dense_ffn", False) or kwargs.get("eagle3_shared_kv", False):
+            raise ValueError("Recursive MTP requires MoE and independent draft KV")
+        if kwargs.get("dflash_num_layers", 1) != 1:
+            raise ValueError("Recursive MTP supports one physical draft layer")
+        if num_draft_slots < 1:
+            raise ValueError("num_draft_slots must be positive")
+        window = sliding_window or None
+        if window is not None and (window < 0 or not swa_rope_theta):
+            raise ValueError("A positive draft window requires swa_rope_theta")
+        config = dict(target_config or {})
+        for key in ("model_type", "architectures", "auto_map", "_name_or_path"):
+            config.pop(key, None)
+        config.update(kwargs)
+        config.update(
+            num_hidden_layers=1,
+            num_mtp_layers=1,
+            mlp_only_layers=[],
+            shared_kv_num_layers=0,
+            no_rope_layers=[],
+            use_hybrid_layers=True,
+            use_sliding_window=window is not None,
+            sliding_window=window,
+            first_layers_types=[
+                "sliding_attention" if window is not None else "full_attention"
+            ],
+            hybrid_layers_types_block=[],
+            num_hybrid_layers_block=0,
+            last_layers_types=[],
+        )
+        if swa_rope_theta is not None:
+            config["swa_rope_theta"] = swa_rope_theta
+        super().__init__(**config)
+        self.target_config = dict(target_config or {})
+        self.num_draft_slots = num_draft_slots
+        self.fp32_residual_connection = fp32_residual_connection
+        self.draft_type = draft_type
+
+
+__all__ = ["IQuestQ1Config", "IQuestQ1MTPRecursiveConfig"]
