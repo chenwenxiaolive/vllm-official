@@ -78,9 +78,6 @@ vllm serve /path/to/iquest-q1 \
     --speculative-config '{"method":"mtp_recursive","model":"/path/to/draft","num_speculative_tokens":7}'
 ```
 
-For target checkpoints using the legacy `iquest_moe_v1_3` model type, add
-`--hf-overrides '{"model_type":"iquest_q1","architectures":["IQuestQ1ForCausalLM"]}'`.
-
 The native `method="mtp"` path is not supported for IQuestQ1. Embedded
 `mtp_layers.*` weights in target checkpoints are ignored.
 
