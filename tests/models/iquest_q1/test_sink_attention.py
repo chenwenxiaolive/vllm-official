@@ -13,14 +13,13 @@ import torch
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
+if not current_platform.is_cuda():
+    pytest.skip("IQuest sink attention requires CUDA", allow_module_level=True)
+
 try:
     from vllm.vllm_flash_attn import is_fa_version_supported
 except ImportError:
-    if current_platform.is_rocm():
-        pytest.skip(
-            "vllm_flash_attn is not supported for vLLM on ROCm.",
-            allow_module_level=True,
-        )
+    pytest.skip("vllm_flash_attn is unavailable", allow_module_level=True)
 
 
 @pytest.mark.parametrize("fa_version", [2, 3, 4])

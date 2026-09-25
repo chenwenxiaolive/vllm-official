@@ -66,8 +66,10 @@ steps:
   - tests/models/transformers/test_backend.py
   - tests/models/test_registry.py
   - tests/models/test_deepseek_v4_vl_rocm.py
+  - tests/models/iquest_q1/test_sink_attention.py
   commands:
     - pytest -v -s models/test_terratorch.py models/transformers/test_backend.py models/test_registry.py models/test_deepseek_v4_vl_rocm.py
+    - pytest -v -s models/iquest_q1/test_sink_attention.py
   mirror:
     amd:
       label: ":amd: (MI300) Basic Models (Other)"
@@ -185,7 +187,7 @@ steps:
   - tests/model_executor/layers/test_activation.py
   device: cpu-small
   commands:
-    - pytest -v -s models/test_utils.py models/test_vision.py models/test_adapters.py models/test_qwen3_5_mtp_config.py models/iquest_q1/ models/transformers/fusers/ model_executor/layers/test_activation.py
+    - pytest -v -s models/test_utils.py models/test_vision.py models/test_adapters.py models/test_qwen3_5_mtp_config.py models/iquest_q1/test_model.py models/iquest_q1/test_mtp.py models/transformers/fusers/ model_executor/layers/test_activation.py
   mirror:
     amd:
       label: ":amd: (MI250) Basic Models Other"

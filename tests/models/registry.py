@@ -1795,6 +1795,13 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         speculative_model="internlm/Intern-S2-Mobius",
         is_available_online=False,
     ),
+    # Placeholder names until the target and standalone draft are published.
+    "IQuestQ1MTPRecursive": _HfExamplesInfo(
+        "IQuestLab/IQuest-Q1",
+        speculative_model="IQuestLab/IQuest-Q1-MTP-Recursive",
+        speculative_method="mtp_recursive",
+        is_available_online=False,
+    ),
     "KimiK3MTPModel": _HfExamplesInfo(
         "moonshotai/Kimi-K3",
         speculative_model="moonshotai/Kimi-K3",
