@@ -220,6 +220,8 @@ class IQuestQ1Attention(nn.Module):
         vllm_config: VllmConfig,
         prefix: str = "",
         is_mtp_layer: bool = False,
+        draft_sliding_window: int | None = None,
+        draft_rope_theta: float | None = None,
     ) -> None:
         super().__init__()
 
@@ -303,6 +305,11 @@ class IQuestQ1Attention(nn.Module):
             )
             if real_sliding_window:
                 rope_parameters["rope_theta"] = config.swa_rope_theta
+
+        if draft_sliding_window is not None:
+            real_sliding_window = draft_sliding_window
+        if draft_rope_theta is not None:
+            rope_parameters["rope_theta"] = draft_rope_theta
 
         no_rope_layers = getattr(config, "no_rope_layers", [])
         current_layer_no_rope = layer_idx in no_rope_layers

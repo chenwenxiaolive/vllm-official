@@ -67,6 +67,32 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## IQuestQ1 Recursive Drafts
+
+IQuestQ1 also supports standalone `mtp_strict_draft` checkpoints trained with
+`draft_type: eagle3`. Select `mtp_recursive` and supply the draft checkpoint:
+
+```bash
+vllm serve /path/to/iquest-q1 \
+    --tensor-parallel-size 8 \
+    --speculative-config '{"method":"mtp_recursive","model":"/path/to/draft","num_speculative_tokens":7}'
+```
+
+For target checkpoints using the legacy `iquest_moe_v1_3` model type, add
+`--hf-overrides '{"model_type":"iquest_q1","architectures":["IQuestQ1ForCausalLM"]}'`.
+
+The EAGLE proposer runs one physical draft layer repeatedly. Each step consumes
+the previous step's token and normalized hidden state and appends its own KV.
+The initial hidden state is the target's final normalized output. The draft's
+`target_config` supplies architecture dimensions; its own `sliding_window` and
+`swa_rope_theta` control draft attention. FP32 residual connections are honored
+when requested by the checkpoint.
+
+When omitted, `num_speculative_tokens` defaults to `num_draft_slots`. Depths
+beyond the training depth are allowed with a warning. Parallel drafting,
+diffusion drafts, dense FFN variants, and shared-KV variants are unsupported.
+The draft and target must have matching hidden sizes and vocabularies.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.
