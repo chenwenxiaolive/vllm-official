@@ -25,7 +25,6 @@ class IQuestQ1Config(PretrainedConfig):
         rms_norm_eps: float = 1e-6,
         num_experts: int = 256,
         num_experts_per_tok: int = 8,
-        num_mtp_layers: int = 2,
         mlp_only_layers: list[int] | None = None,
         use_hybrid_layers: bool = True,
         first_layers_types: list[str] | None = None,
@@ -66,7 +65,6 @@ class IQuestQ1Config(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.num_experts = num_experts
         self.num_experts_per_tok = num_experts_per_tok
-        self.num_mtp_layers = num_mtp_layers
         self.mlp_only_layers = [0] if mlp_only_layers is None else list(mlp_only_layers)
         self.use_hybrid_layers = use_hybrid_layers
         self.first_layers_types = (
@@ -174,7 +172,6 @@ class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
         config.update(kwargs)
         config.update(
             num_hidden_layers=1,
-            num_mtp_layers=1,
             mlp_only_layers=[],
             shared_kv_num_layers=0,
             no_rope_layers=[],

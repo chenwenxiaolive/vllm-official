@@ -64,7 +64,6 @@ MTPModelTypes = Literal[
     "gemma4_mtp",
     "inkling_mtp",
     "glm5_next_mtp",
-    "iquest_q1_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash"]
@@ -719,19 +718,6 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]}
             )
 
-        if hf_config.architectures[0] == "IQuestQ1ForCausalLM":
-            n_predict = getattr(hf_config, "num_mtp_layers", 0)
-            if n_predict < 1:
-                raise ValueError("IQuestQ1 MTP requires num_mtp_layers > 0")
-            hf_config.model_type = "iquest_q1_mtp"
-            hf_config.update(
-                {
-                    "n_predict": 1,
-                    "num_nextn_predict_layers": 1,
-                    "architectures": ["IQuestQ1MTP"],
-                }
-            )
-
         if hf_config.model_type == "kimi_k3":
             # Kimi-K3 keeps the text-model fields (incl. the MTP layer count)
             # nested under ``text_config`` (a KimiLinearConfig).
@@ -1156,6 +1142,16 @@ class SpeculativeConfig:
                 "method `%s` is deprecated and replaced with mtp.", self.method
             )
             self.method = "mtp"
+
+        if (
+            self.method == "mtp"
+            and self.target_model_config is not None
+            and self.target_model_config.hf_config.model_type == "iquest_q1"
+        ):
+            raise ValueError(
+                "IQuestQ1 does not support method='mtp'; use method='mtp_recursive' "
+                "with a standalone draft checkpoint."
+            )
 
         if self.model is None and self.num_speculative_tokens is not None:
             if self.method == "mtp":

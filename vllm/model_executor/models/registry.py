@@ -625,7 +625,6 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
-    "IQuestQ1MTP": ("vllm.models.iquest_q1", "IQuestQ1MTP"),
     "IQuestQ1MTPRecursive": (
         "vllm.models.iquest_q1.mtp_recursive",
         "IQuestQ1MTPRecursive",

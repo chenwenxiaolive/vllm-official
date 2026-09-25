@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm.config import ModelConfig
 from vllm.config.speculative import SpeculativeConfig
 from vllm.models.iquest_q1 import model as iquest_model
 from vllm.models.iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
@@ -161,25 +162,22 @@ def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("num_mtp_layers", [1, 2])
-def test_mtp_config_serves_one_draft_layer(num_mtp_layers):
-    """The checkpoint depth is preserved while multi-module dispatch is disabled."""
-    config = IQuestQ1Config(
-        architectures=["IQuestQ1ForCausalLM"], num_mtp_layers=num_mtp_layers
-    )
-    draft = SpeculativeConfig.hf_config_override(config)
-    assert draft.architectures == ["IQuestQ1MTP"]
-    assert draft.model_type == "iquest_q1_mtp"
-    assert draft.num_hidden_layers == 88
-    assert draft.num_mtp_layers == num_mtp_layers
-    assert draft.n_predict == 1
-    assert draft.num_nextn_predict_layers == 1
-    spec = SimpleNamespace(
-        method="mtp",
-        draft_model_config=SimpleNamespace(hf_config=draft),
-        num_speculative_tokens=2,
-    )
-    assert not SpeculativeConfig.use_multi_module_mtp(spec)
+@pytest.mark.parametrize("explicit_draft", [False, True])
+def test_native_mtp_rejected_before_loading_draft(tmp_path, explicit_draft):
+    """Legacy checkpoint metadata must not enable the removed native MTP path."""
+    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"], num_mtp_layers=2)
+    config.save_pretrained(tmp_path)
+    target = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
+    with pytest.raises(ValueError, match="use method='mtp_recursive'"):
+        SpeculativeConfig(
+            method="mtp",
+            model=str(tmp_path) if explicit_draft else None,
+            num_speculative_tokens=2,
+            target_model_config=target,
+        )
+    assert SpeculativeConfig.hf_config_override(config).architectures == [
+        "IQuestQ1ForCausalLM"
+    ]
 
 
 @pytest.mark.cpu_test

@@ -9,32 +9,63 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (
     get_draft_quant_config,
+    is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     maybe_prefix,
 )
 from vllm.sequence import IntermediateTensors
 
-from .model import IQuestQ1RMSNorm
-from .mtp import IQuestQ1MTP, IQuestQ1MTPInnerLayer
+from .model import IQuestQ1Attention, IQuestQ1MoEBlock, IQuestQ1RMSNorm
+
+logger = init_logger(__name__)
 
 
-class IQuestQ1RecursiveInnerLayer(IQuestQ1MTPInnerLayer):
+class IQuestQ1RecursiveInnerLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
         config = vllm_config.model_config.hf_config
-        super().__init__(
+        quant_config = vllm_config.quant_config
+        self.hidden_size = config.hidden_size
+
+        self.self_attn = IQuestQ1Attention(
             vllm_config=vllm_config,
-            prefix=prefix,
+            prefix=f"{prefix}.self_attn",
+            is_mtp_layer=True,
             draft_sliding_window=config.sliding_window,
             draft_rope_theta=(config.swa_rope_theta if config.sliding_window else None),
         )
+        self.mlp = IQuestQ1MoEBlock(
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.mlp",
+        )
+        self.attention_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.attn_out_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.feed_forward_norm = IQuestQ1RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        self.ffn_out_norm = IQuestQ1RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attn_out_scale = getattr(config, "first_layer_attn_out_scale", 1.0)
+        self.ffn_out_scale = getattr(config, "first_layer_ffn_out_scale", 1.0)
         self.fp32_residual_connection = config.fp32_residual_connection
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
@@ -153,30 +184,139 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         qkv_shards: set[str] = set()
+        stacked_params_mapping = [
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+        ]
 
-        def mapped_weights():
-            for name, weight in weights:
-                if name == "target_final_norm.weight":
-                    # The proposer already supplies post-norm target hidden states.
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+        expert_params_mapping = fused_moe_make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.num_experts,
+        )
+        enable_sink_attention = getattr(self.config, "enable_sink_attention", False)
+
+        def _load_into(param_name: str, weight: torch.Tensor) -> None:
+            param = params_dict[param_name]
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, weight)
+            loaded_params.add(param_name)
+
+        for name, loaded_weight in weights:
+            if name == "target_final_norm.weight":
+                # The proposer already supplies post-norm target hidden states.
+                continue
+            if name == "embed_tokens.weight":
+                _load_into("model.embed_tokens.weight", loaded_weight)
+                continue
+            if name == "lm_head.weight":
+                _load_into(name, loaded_weight)
+                continue
+            if not name.startswith("mtp."):
+                raise ValueError(f"Unexpected recursive MTP weight: {name}")
+            for shard in ("q", "k", "v"):
+                if name.endswith(f".self_attn.{shard}_proj.weight"):
+                    qkv_shards.add(shard)
+            name = f"model.layers.{self.mtp_start_layer_idx}." + name.removeprefix(
+                "mtp."
+            )
+
+            # Fused QKV: match on the exact ".<component>.weight" suffix.
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                suffix = f".{weight_name}.weight"
+                if not name.endswith(suffix):
                     continue
-                if name == "embed_tokens.weight":
-                    yield "model.embed_tokens.weight", weight
-                elif name.startswith("mtp."):
-                    for shard in ("q", "k", "v"):
-                        if name.endswith(f".self_attn.{shard}_proj.weight"):
-                            qkv_shards.add(shard)
-                    yield "mtp_layers.0." + name.removeprefix("mtp."), weight
-                elif name == "lm_head.weight":
-                    yield name, weight
-                else:
-                    raise ValueError(f"Unexpected recursive MTP weight: {name}")
+                mapped = name[: -len(suffix)] + f".{param_name}.weight"
+                if mapped not in params_dict:
+                    continue
+                param = params_dict[mapped]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded_params.add(mapped)
+                break
+            else:
+                expert_weight_matched = False
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    expert_weight_matched = True
+                    mapped = name.replace(weight_name, param_name)
+                    if not is_pp_missing_parameter(mapped, self):
+                        param = params_dict[mapped]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
+                        loaded_params.add(mapped)
+                    break
 
-        loaded = IQuestQ1MTP.load_weights(self, mapped_weights())
+                if expert_weight_matched:
+                    continue
+
+                if name.endswith(".mlp.experts.fc"):
+                    mapped = name[: -len(".fc")] + ".routed_experts.w13_weight"
+                    param = params_dict[mapped]
+                    weight_loader = param.weight_loader
+                    for expert_id in range(self.config.num_experts):
+                        weight_loader(
+                            param,
+                            loaded_weight[expert_id][: self.config.intermediate_size],
+                            mapped,
+                            shard_id="w1",
+                            expert_id=expert_id,
+                        )
+                        weight_loader(
+                            param,
+                            loaded_weight[expert_id][self.config.intermediate_size :],
+                            mapped,
+                            shard_id="w3",
+                            expert_id=expert_id,
+                        )
+                    loaded_params.add(mapped)
+                    continue
+                if name.endswith(".mlp.experts.proj"):
+                    mapped = name[: -len(".proj")] + ".routed_experts.w2_weight"
+                    param = params_dict[mapped]
+                    weight_loader = param.weight_loader
+                    for expert_id in range(self.config.num_experts):
+                        weight_loader(
+                            param,
+                            loaded_weight[expert_id],
+                            mapped,
+                            shard_id="w2",
+                            expert_id=expert_id,
+                        )
+                    loaded_params.add(mapped)
+                    continue
+
+                if not enable_sink_attention and name.endswith(".sink_k"):
+                    logger.warning_once("sink attention feature is disabled")
+                    continue
+
+                if name.endswith(".mlp.router.weight"):
+                    name = name[: -len(".router.weight")] + ".gate.weight"
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+                if name not in params_dict:
+                    logger.warning_once("Unexpected MTP weight skipped: %s", name)
+                    continue
+                _load_into(name, loaded_weight)
+
         if qkv_shards != {"q", "k", "v"}:
             raise ValueError("Recursive MTP checkpoint is missing QKV projections")
-        missing = set(dict(self.named_parameters())) - loaded
+        missing = set(params_dict) - loaded_params
         if missing:
             raise ValueError(
                 f"Recursive MTP checkpoint is missing weights: {sorted(missing)}"
             )
-        return loaded
+        return loaded_params

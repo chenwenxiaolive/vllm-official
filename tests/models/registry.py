@@ -1789,11 +1789,6 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         trust_remote_code=True,
         max_model_len=4096,
     ),
-    "IQuestQ1MTP": _HfExamplesInfo(
-        "IQuestLab/IQuest-Q1",
-        speculative_model="IQuestLab/IQuest-Q1",
-        is_available_online=False,
-    ),
     "InternS2MobiusMTP": _HfExamplesInfo(
         "internlm/Intern-S2-Mobius",
         trust_remote_code=True,

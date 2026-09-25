@@ -69,7 +69,7 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
 
 ## IQuestQ1 Recursive Drafts
 
-IQuestQ1 also supports standalone `mtp_strict_draft` checkpoints trained with
+IQuestQ1 supports standalone `mtp_strict_draft` checkpoints trained with
 `draft_type: eagle3`. Select `mtp_recursive` and supply the draft checkpoint:
 
 ```bash
@@ -80,6 +80,9 @@ vllm serve /path/to/iquest-q1 \
 
 For target checkpoints using the legacy `iquest_moe_v1_3` model type, add
 `--hf-overrides '{"model_type":"iquest_q1","architectures":["IQuestQ1ForCausalLM"]}'`.
+
+The native `method="mtp"` path is not supported for IQuestQ1. Embedded
+`mtp_layers.*` weights in target checkpoints are ignored.
 
 The EAGLE proposer runs one physical draft layer repeatedly. Each step consumes
 the previous step's token and normalized hidden state and appends its own KV.
