@@ -220,6 +220,8 @@ def test_router_dtype_preserves_expert_activation_dtype(
 ):
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
+    from vllm.model_executor.layers.fused_moe.router import gate_linear
+    from vllm.utils.torch_utils import set_default_torch_dtype
 
     captured = {}
 
@@ -232,11 +234,22 @@ def test_router_dtype_preserves_expert_activation_dtype(
     for module in (linear, parameter):
         monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
         monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        gate_linear,
+        "current_platform",
+        SimpleNamespace(
+            is_cuda=lambda: False,
+            is_rocm=lambda: False,
+            is_device_capability=lambda _: False,
+            is_device_capability_family=lambda _: False,
+        ),
+    )
     monkeypatch.setattr(iquest_model, "FusedMoEFactory", lambda **kwargs: Experts())
     config = IQuestQ1Config(moe_router_dtype=name)
-    block = IQuestQ1MoEBlock(
-        8, 2, 16, 32, router_dtype=getattr(torch, config.moe_router_dtype)
-    )
+    with set_default_torch_dtype(torch.bfloat16):
+        block = IQuestQ1MoEBlock(
+            8, 2, 16, 32, router_dtype=getattr(torch, config.moe_router_dtype)
+        )
     generator = torch.Generator().manual_seed(42)
     weight = torch.randn(8, 16, generator=generator).bfloat16()
     block.gate.weight_loader(block.gate.weight, weight)
@@ -327,10 +340,12 @@ def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-@pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 1024])
+@pytest.mark.parametrize("num_tokens", [1, 8, 16, 32, 128, 1024])
 @torch.inference_mode()
-def test_router_matches_fp32_eager_after_loading_bf16_weights(monkeypatch, num_tokens):
-    """Router dispatch must not lose FP32 precision at decode or prefill sizes."""
+def test_gate_linear_preserves_fp32_logits_with_model_dtype_weights(
+    monkeypatch, num_tokens
+):
+    """Keep model-dtype router weights on supported GPUs without BF16 logits."""
     from vllm.model_executor import parameter
     from vllm.model_executor.layers import linear
     from vllm.utils.torch_utils import set_default_torch_dtype
@@ -349,6 +364,10 @@ def test_router_matches_fp32_eager_after_loading_bf16_weights(monkeypatch, num_t
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     with set_default_torch_dtype(torch.bfloat16):
         block = IQuestQ1MoEBlock(256, 8, 3072, 1536).cuda()
+    expected_weight_dtype = (
+        torch.bfloat16 if block.gate.allow_specialized_router_gemm else torch.float32
+    )
+    assert block.gate.weight.dtype == expected_weight_dtype
     generator = torch.Generator(device="cuda").manual_seed(42)
     weight = torch.randn(256, 3072, generator=generator, device="cuda").bfloat16()
     block.gate.weight_loader(block.gate.weight, weight)
@@ -356,7 +375,8 @@ def test_router_matches_fp32_eager_after_loading_bf16_weights(monkeypatch, num_t
     expected = torch.nn.functional.linear(x.float(), weight.float())
 
     torch.testing.assert_close(block(x), x, rtol=0, atol=0)
-    torch.testing.assert_close(captured["logits"], expected, rtol=0, atol=0)
+    assert captured["logits"].dtype == torch.float32
+    torch.testing.assert_close(captured["logits"], expected, rtol=1e-4, atol=1e-3)
 
 
 @pytest.mark.cpu_test

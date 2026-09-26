@@ -35,10 +35,10 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -138,12 +138,13 @@ class IQuestQ1MoEBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        self.gate = ReplicatedLinear(
+        self.gate = GateLinear(
             hidden_size,
             num_experts,
             bias=False,
-            params_dtype=router_dtype,
-            quant_config=None,
+            params_dtype=None if router_dtype == torch.float32 else router_dtype,
+            out_dtype=router_dtype,
+            force_fp32_compute=router_dtype == torch.float32,
             prefix=f"{prefix}.gate",
         )
 
@@ -166,7 +167,7 @@ class IQuestQ1MoEBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.to(self.gate.weight.dtype))
+        router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )

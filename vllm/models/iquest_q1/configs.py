@@ -138,6 +138,7 @@ class IQuestQ1Config(PretrainedConfig):
         self.first_layer_ffn_out_scale = first_layer_ffn_out_scale
         self.softmax_scale = softmax_scale
         self.logit_scale = logit_scale
+        # GateLinear selects weight/compute dtypes; this controls router logits.
         self.moe_router_dtype = {
             "fp32": "float32",
             "fp16": "float16",
