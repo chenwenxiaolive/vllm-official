@@ -26,6 +26,7 @@ def tiny_config(monkeypatch):
         intermediate_size=3,
         num_experts=2,
         num_experts_per_tok=1,
+        moe_router_dtype="float32",
         rms_norm_eps=1e-5,
         first_layer_attn_out_scale=0.7,
         first_layer_ffn_out_scale=0.4,

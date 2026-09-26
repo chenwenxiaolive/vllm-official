@@ -22,6 +22,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.model import str_dtype_to_torch_dtype
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
@@ -130,6 +131,7 @@ class IQuestQ1MoEBlock(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         quant_config: QuantizationConfig | None = None,
+        router_dtype: torch.dtype = torch.float32,
         tp_size: int | None = None,
         prefix: str = "",
     ):
@@ -140,7 +142,7 @@ class IQuestQ1MoEBlock(nn.Module):
             hidden_size,
             num_experts,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=router_dtype,
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
@@ -152,7 +154,7 @@ class IQuestQ1MoEBlock(nn.Module):
             intermediate_size=intermediate_size,
             reduce_results=True,
             renormalize=True,
-            router_logits_dtype=torch.float32,
+            router_logits_dtype=router_dtype,
             quant_config=quant_config,
             tp_size=tp_size,
             prefix=f"{prefix}.experts",
@@ -164,8 +166,7 @@ class IQuestQ1MoEBlock(nn.Module):
         hidden_dim = hidden_states.shape[-1]
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
-        # IQuestQ1 computes router logits in FP32 and normalizes over selected experts.
-        router_logits, _ = self.gate(hidden_states.float())
+        router_logits, _ = self.gate(hidden_states.to(self.gate.weight.dtype))
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -442,6 +443,7 @@ class IQuestQ1DecoderLayer(nn.Module):
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 quant_config=quant_config,
+                router_dtype=str_dtype_to_torch_dtype(config.moe_router_dtype),
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -790,7 +792,11 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.logits_processor = LogitsProcessor(
             config.vocab_size, scale=getattr(config, "logit_scale", 1.0)
         )
-        self.logits_processor.head_dtype = torch.float32
+        self.logits_processor.head_dtype = (
+            torch.float32
+            if config.enable_lm_head_fp32
+            else vllm_config.model_config.dtype
+        )
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

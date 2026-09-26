@@ -663,7 +663,7 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "mtp_strict_draft":
+        if hf_config.model_type == "iquest_q1_mtp_recursive":
             hf_config.architectures = ["IQuestQ1MTPRecursive"]
         initial_architecture = hf_config.architectures[0]
         use_v32_mtp = hf_config.model_type in ("deepseek_v32", "glm_moe_dsa")
@@ -1497,12 +1497,12 @@ class SpeculativeConfig:
                     draft_hf = self.draft_model_config.hf_config
                     target_hf = self.target_model_config.hf_config
                     if (
-                        draft_hf.model_type != "mtp_strict_draft"
+                        draft_hf.model_type != "iquest_q1_mtp_recursive"
                         or target_hf.model_type != "iquest_q1"
                     ):
                         raise ValueError(
                             "mtp_recursive requires an IQuestQ1 target and "
-                            "mtp_strict_draft checkpoint"
+                            "iquest_q1_mtp_recursive checkpoint"
                         )
                     if self.parallel_drafting:
                         raise ValueError("mtp_recursive requires serial drafting")

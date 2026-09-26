@@ -49,6 +49,8 @@ class IQuestQ1Config(PretrainedConfig):
         first_layer_ffn_out_scale: float = 1.0,
         softmax_scale: float | None = None,
         logit_scale: float = 1.0,
+        moe_router_dtype: str = "fp32",
+        enable_lm_head_fp32: bool = False,
         tie_word_embeddings: bool = False,
         **kwargs,
     ):
@@ -136,6 +138,14 @@ class IQuestQ1Config(PretrainedConfig):
         self.first_layer_ffn_out_scale = first_layer_ffn_out_scale
         self.softmax_scale = softmax_scale
         self.logit_scale = logit_scale
+        self.moe_router_dtype = {
+            "fp32": "float32",
+            "fp16": "float16",
+            "bf16": "bfloat16",
+        }.get(moe_router_dtype, moe_router_dtype)
+        if self.moe_router_dtype not in ("float32", "float16", "bfloat16"):
+            raise ValueError(f"Unsupported moe_router_dtype: {moe_router_dtype!r}")
+        self.enable_lm_head_fp32 = enable_lm_head_fp32
         kwargs.pop("layer_types", None)
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
@@ -143,7 +153,7 @@ class IQuestQ1Config(PretrainedConfig):
 class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
     """Standalone recursive draft with its own attention configuration."""
 
-    model_type = "mtp_strict_draft"
+    model_type = "iquest_q1_mtp_recursive"
 
     def __init__(
         self,
@@ -152,6 +162,7 @@ class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
         sliding_window: int | None = None,
         swa_rope_theta: float | None = None,
         fp32_residual_connection: bool = False,
+        enable_lm_head_fp32: bool = False,
         draft_type: str = "eagle3",
         **kwargs,
     ):
@@ -171,6 +182,7 @@ class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
             config.pop(key, None)
         config.update(kwargs)
         config.update(
+            enable_lm_head_fp32=enable_lm_head_fp32,
             num_hidden_layers=1,
             mlp_only_layers=[],
             shared_kv_num_layers=0,

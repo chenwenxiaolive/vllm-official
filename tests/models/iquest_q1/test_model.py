@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """IQuestQ1 hybrid configuration, routing precision, and checkpoint layout tests."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -26,16 +27,18 @@ from vllm.transformers_utils.config import get_config
 @pytest.mark.cpu_test
 def test_recursive_draft_preserves_own_attention_config(tmp_path):
     target = IQuestQ1Config()
-    config = IQuestQ1MTPRecursiveConfig(
+    config = dict(
+        model_type="iquest_q1_mtp_recursive",
         target_config=target.to_dict(),
-        architectures=["MtpStrictModel"],
+        architectures=["IQuestQ1MtpRecursive"],
         sliding_window=512,
         swa_rope_theta=10000.0,
         num_draft_slots=7,
         fp32_residual_connection=True,
     )
-    config.save_pretrained(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps(config))
     loaded = get_config(str(tmp_path), trust_remote_code=False)
+    assert loaded.model_type == "iquest_q1_mtp_recursive"
     assert loaded.num_hidden_layers == 1
     assert loaded.layer_types == ["sliding_attention"]
     assert loaded.sliding_window == 512
@@ -201,31 +204,126 @@ def test_rms_norm_multiplies_weight_before_casting_to_activation_dtype():
 
 
 @pytest.mark.cpu_test
-def test_router_keeps_fp32_logits_and_bf16_expert_activations():
-    block = IQuestQ1MoEBlock.__new__(IQuestQ1MoEBlock)
-    nn.Module.__init__(block)
-    captured = {}
+@pytest.mark.parametrize(
+    "name,router_dtype",
+    [
+        ("fp32", torch.float32),
+        ("float32", torch.float32),
+        ("bf16", torch.bfloat16),
+        ("bfloat16", torch.bfloat16),
+        ("fp16", torch.float16),
+        ("float16", torch.float16),
+    ],
+)
+def test_router_dtype_preserves_expert_activation_dtype(
+    monkeypatch, name, router_dtype
+):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
 
-    class Gate(nn.Module):
-        def forward(self, x):
-            captured["gate_dtype"] = x.dtype
-            return x[:, :2].float(), None
+    captured = {}
 
     class Experts(nn.Module):
         def forward(self, hidden_states, router_logits):
             captured["expert_dtype"] = hidden_states.dtype
-            captured["logit_dtype"] = router_logits.dtype
+            captured["logits"] = router_logits
             return hidden_states
 
-    block.gate = Gate()
-    block.experts = Experts()
-    x = torch.ones(3, 4, dtype=torch.bfloat16)
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(iquest_model, "FusedMoEFactory", lambda **kwargs: Experts())
+    config = IQuestQ1Config(moe_router_dtype=name)
+    block = IQuestQ1MoEBlock(
+        8, 2, 16, 32, router_dtype=getattr(torch, config.moe_router_dtype)
+    )
+    generator = torch.Generator().manual_seed(42)
+    weight = torch.randn(8, 16, generator=generator).bfloat16()
+    block.gate.weight_loader(block.gate.weight, weight)
+    x = torch.randn(3, 16, generator=generator).bfloat16()
     torch.testing.assert_close(block(x), x)
-    assert captured == {
-        "gate_dtype": torch.float32,
-        "expert_dtype": torch.bfloat16,
-        "logit_dtype": torch.float32,
-    }
+    assert block.gate.weight.dtype == router_dtype
+    assert captured["expert_dtype"] == torch.bfloat16
+    assert captured["logits"].dtype == router_dtype
+    torch.testing.assert_close(
+        captured["logits"],
+        torch.nn.functional.linear(x.to(router_dtype), weight.to(router_dtype)),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.cpu_test
+def test_invalid_router_dtype_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported moe_router_dtype"):
+        IQuestQ1Config(moe_router_dtype="fp64")
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("enable_fp32", [False, True])
+@pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
+def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_dtype):
+    """The draft must not inherit the target head's FP32 flag or global dtype."""
+    from vllm.model_executor.layers import logits_processor
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        UnquantizedEmbeddingMethod,
+    )
+    from vllm.models.iquest_q1 import mtp_recursive
+
+    target = IQuestQ1Config(
+        hidden_size=16, vocab_size=8, enable_lm_head_fp32=True if draft else enable_fp32
+    )
+    config = target
+    if draft:
+        config = IQuestQ1MTPRecursiveConfig(
+            target_config=target.to_dict(),
+            **({"enable_lm_head_fp32": True} if enable_fp32 else {}),
+        )
+    assert config.enable_lm_head_fp32 == enable_fp32
+    model_config = SimpleNamespace(hf_config=config, dtype=model_dtype)
+    vllm_config = SimpleNamespace(
+        model_config=model_config,
+        quant_config=None,
+        speculative_config=SimpleNamespace(draft_model_config=model_config),
+        compilation_config=SimpleNamespace(mode=0),
+    )
+    backbone = nn.Identity()
+    backbone.layer_idx = 88
+    backbone.make_empty_intermediate_tensors = lambda *a, **kw: {}
+    head = nn.Linear(16, 8, bias=False, dtype=model_dtype)
+    head.tp_size = 1
+    head.quant_method = UnquantizedEmbeddingMethod()
+    monkeypatch.setattr(
+        iquest_model, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    monkeypatch.setattr(iquest_model, "IQuestQ1Model", lambda **kw: backbone)
+    monkeypatch.setattr(
+        mtp_recursive, "IQuestQ1RecursivePredictor", lambda **kw: backbone
+    )
+    monkeypatch.setattr(mtp_recursive, "get_draft_quant_config", lambda _: None)
+    for module in (iquest_model, mtp_recursive):
+        monkeypatch.setattr(module, "ParallelLMHead", lambda *a, **kw: head)
+    monkeypatch.setattr(
+        logits_processor,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(head_dtype=torch.float32)),
+    )
+    cls = mtp_recursive.IQuestQ1MTPRecursive if draft else IQuestQ1ForCausalLM
+    model = cls(vllm_config=vllm_config)
+    hidden = torch.randn(3, 16, dtype=model_dtype)
+    logits = model.compute_logits(hidden)
+    expected_dtype = torch.float32 if enable_fp32 else model_dtype
+    assert logits.dtype == expected_dtype
+    assert model.lm_head.weight.dtype == model_dtype
+    torch.testing.assert_close(
+        logits,
+        torch.nn.functional.linear(
+            hidden.to(expected_dtype), head.weight.to(expected_dtype)
+        ),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")

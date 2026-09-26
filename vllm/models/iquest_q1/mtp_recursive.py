@@ -9,6 +9,7 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.config.model import str_dtype_to_torch_dtype
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -51,6 +52,7 @@ class IQuestQ1RecursiveInnerLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
+            router_dtype=str_dtype_to_torch_dtype(config.moe_router_dtype),
             prefix=f"{prefix}.mlp",
         )
         self.attention_norm = IQuestQ1RMSNorm(
@@ -157,6 +159,11 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        self.logits_processor.head_dtype = (
+            torch.float32
+            if self.config.enable_lm_head_fp32
+            else vllm_config.model_config.dtype
+        )
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states"], self.config.hidden_size
         )

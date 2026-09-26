@@ -69,8 +69,8 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
 
 ## IQuestQ1 Recursive Drafts
 
-IQuestQ1 supports standalone `mtp_strict_draft` checkpoints trained with
-`draft_type: eagle3`. Select `mtp_recursive` and supply the draft checkpoint:
+IQuestQ1 supports standalone `iquest_q1_mtp_recursive` checkpoints.
+Select `mtp_recursive` and supply the draft checkpoint:
 
 ```bash
 vllm serve /path/to/iquest-q1 \
@@ -87,6 +87,14 @@ The initial hidden state is the target's final normalized output. The draft's
 `target_config` supplies architecture dimensions; its own `sliding_window` and
 `swa_rope_theta` control draft attention. FP32 residual connections are honored
 when requested by the checkpoint.
+
+`moe_router_dtype` selects the router weight and computation dtype (`fp32`,
+`bf16`, or `fp16`, also accepting their full names). It defaults to FP32;
+the draft inherits it from `target_config` unless overridden at the top level.
+`enable_lm_head_fp32` selects FP32 output-head logits when true and the model
+dtype when false (the default). The draft has an independent top-level switch:
+it does not inherit this flag from `target_config`. Head weights stay in the
+model dtype.
 
 When omitted, `num_speculative_tokens` defaults to `num_draft_slots`. Depths
 beyond the training depth are allowed with a warning. Parallel drafting,
