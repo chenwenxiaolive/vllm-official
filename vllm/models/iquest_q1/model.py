@@ -34,10 +34,10 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEFactory,
     fused_moe_make_expert_params_mapping,
 )
-from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -129,7 +129,6 @@ class IQuestQ1MoEBlock(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        params_dtype: torch.dtype | None = None,
         quant_config: QuantizationConfig | None = None,
         tp_size: int | None = None,
         prefix: str = "",
@@ -137,13 +136,12 @@ class IQuestQ1MoEBlock(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        self.gate = GateLinear(
+        self.gate = ReplicatedLinear(
             hidden_size,
             num_experts,
             bias=False,
-            params_dtype=params_dtype,
-            out_dtype=torch.float32,
-            force_fp32_compute=True,
+            params_dtype=torch.float32,
+            quant_config=None,
             prefix=f"{prefix}.gate",
         )
 
@@ -167,7 +165,7 @@ class IQuestQ1MoEBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
         # router_logits: (num_tokens, n_experts)
         # IQuestQ1 computes router logits in FP32 and normalizes over selected experts.
-        router_logits, _ = self.gate(hidden_states)
+        router_logits, _ = self.gate(hidden_states.float())
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
         )
@@ -792,6 +790,7 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.logits_processor = LogitsProcessor(
             config.vocab_size, scale=getattr(config, "logit_scale", 1.0)
         )
+        self.logits_processor.head_dtype = torch.float32
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )

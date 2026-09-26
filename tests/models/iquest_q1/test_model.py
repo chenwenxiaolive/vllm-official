@@ -222,10 +222,43 @@ def test_router_keeps_fp32_logits_and_bf16_expert_activations():
     x = torch.ones(3, 4, dtype=torch.bfloat16)
     torch.testing.assert_close(block(x), x)
     assert captured == {
-        "gate_dtype": torch.bfloat16,
+        "gate_dtype": torch.float32,
         "expert_dtype": torch.bfloat16,
         "logit_dtype": torch.float32,
     }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 1024])
+@torch.inference_mode()
+def test_router_matches_fp32_eager_after_loading_bf16_weights(monkeypatch, num_tokens):
+    """Router dispatch must not lose FP32 precision at decode or prefill sizes."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    captured = {}
+
+    class Experts(nn.Module):
+        def forward(self, hidden_states, router_logits):
+            captured["logits"] = router_logits
+            return hidden_states
+
+    for module in (linear, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(iquest_model, "FusedMoEFactory", lambda **kwargs: Experts())
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    with set_default_torch_dtype(torch.bfloat16):
+        block = IQuestQ1MoEBlock(256, 8, 3072, 1536).cuda()
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    weight = torch.randn(256, 3072, generator=generator, device="cuda").bfloat16()
+    block.gate.weight_loader(block.gate.weight, weight)
+    x = torch.randn(num_tokens, 3072, generator=generator, device="cuda").bfloat16()
+    expected = torch.nn.functional.linear(x.float(), weight.float())
+
+    torch.testing.assert_close(block(x), x, rtol=0, atol=0)
+    torch.testing.assert_close(captured["logits"], expected, rtol=0, atol=0)
 
 
 @pytest.mark.cpu_test

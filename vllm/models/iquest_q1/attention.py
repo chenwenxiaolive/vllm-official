@@ -9,7 +9,7 @@ import torch
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention import Attention
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 from vllm.v1.attention.backend import AttentionType
@@ -61,14 +61,23 @@ def _apply_sink_key_kernel(
         valid,
         0,
     ).to(tl.float32)
-    sink_logit = tl.sum(q * sink, axis=1) * SCALE
+    products = q * sink
+    if HEAD_SIZE == 128:
+        # Match the FP32 eager reduction order for the model's head size.
+        even, odd = tl.split(products.reshape(BLOCK_ROWS, HEAD_SIZE // 2, 2))
+        first, third = tl.split(even.reshape(BLOCK_ROWS, HEAD_SIZE // 4, 2))
+        second, fourth = tl.split(odd.reshape(BLOCK_ROWS, HEAD_SIZE // 4, 2))
+        sink_dot = tl.sum(((first + second) + third) + fourth, axis=1)
+    else:
+        sink_dot = tl.sum(products, axis=1)
+    sink_logit = sink_dot * SCALE
     normal_lse = tl.load(
         lse + heads * lse_stride_h + tokens * lse_stride_t,
         tokens < num_tokens,
         0,
     )
     # Adding a zero-valued sink changes only the softmax denominator.
-    factor = tl.sigmoid(normal_lse - sink_logit)
+    factor = tl.div_rn(1.0, 1.0 + tldevice.exp(sink_logit - normal_lse))
     offsets = (
         tokens[:, None] * output_stride_t
         + heads[:, None] * output_stride_h
@@ -90,7 +99,7 @@ def apply_sink_key(
     if num_tokens == 0:
         return
     num_heads, head_size = query.shape[1:]
-    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, 8),)](
+    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, 4),)](
         query,
         sink_key,
         output,
@@ -104,8 +113,10 @@ def apply_sink_key(
         QUERIES_PER_KV=num_heads // sink_key.shape[0],
         HEAD_SIZE=head_size,
         SCALE=scale,
-        BLOCK_ROWS=8,
+        BLOCK_ROWS=4,
         BLOCK_D=triton.next_power_of_2(head_size),
+        num_warps=4,
+        enable_fp_fusion=False,
     )
 
 

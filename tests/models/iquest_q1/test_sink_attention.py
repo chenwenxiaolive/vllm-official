@@ -22,6 +22,41 @@ except ImportError:
     pytest.skip("vllm_flash_attn is unavailable", allow_module_level=True)
 
 
+@pytest.mark.parametrize("num_tokens", [0, 1, 17, 1024])
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_sink_preserves_fp32_eager_rounding(num_tokens, output_dtype, strided):
+    """The sink correction must preserve rounding and leave padded rows untouched."""
+    from vllm.models.iquest_q1.attention import apply_sink_key
+
+    set_random_seed(42)
+    num_heads, num_kv_heads, head_size = 6, 2, 128
+    storage_heads = num_heads + int(strided)
+    query = torch.randn(
+        num_tokens + 3, storage_heads, head_size, device="cuda", dtype=torch.bfloat16
+    )[1:, :num_heads]
+    sink = torch.randn(num_kv_heads, head_size, device="cuda", dtype=torch.bfloat16)
+    output = torch.randn(
+        num_tokens + 3, storage_heads, head_size, device="cuda", dtype=output_dtype
+    )[1:, :num_heads]
+    before = output.clone()
+    repeated_sink = sink.repeat_interleave(num_heads // num_kv_heads, dim=0)
+    scale = head_size**-0.5
+    dot = (query[:num_tokens].float() * repeated_sink.float()).sum(-1) * scale
+    lse = (dot + torch.randn_like(dot)).T
+    if not strided:
+        lse = lse.contiguous()
+    expected = (
+        before[:num_tokens].float() * torch.sigmoid(lse.T - dot).unsqueeze(-1)
+    ).to(output_dtype)
+
+    apply_sink_key(query, sink, output, lse, scale, num_tokens)
+
+    torch.testing.assert_close(output[:num_tokens], expected, rtol=0, atol=0)
+    torch.testing.assert_close(output[num_tokens:], before[num_tokens:], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("fa_version", [2, 3, 4])
 @pytest.mark.parametrize("num_heads", [(6, 1), (6, 2)])
 @pytest.mark.parametrize("head_size", [72, 128])
