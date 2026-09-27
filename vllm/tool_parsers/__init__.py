@@ -106,10 +106,6 @@ _TOOL_PARSERS_TO_REGISTER = {
         "internlm2_tool_parser",
         "Internlm2ToolParser",
     ),
-    "iquest_q1": (
-        "iquest_q1_tool_parser",
-        "IQuestQ1ToolParser",
-    ),
     "jamba": (
         "jamba_tool_parser",
         "JambaToolParser",

@@ -5,14 +5,14 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from vllm_iquest_q1.reasoning_parser import (
+    IQuestQ1ReasoningParser,
+)
+from vllm_iquest_q1.tool_parser import IQuestQ1ToolParser
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.parser.abstract_parser import DelegatingParser
-from vllm.reasoning.iquest_q1_reasoning_parser import (
-    IQuestQ1ReasoningParser,
-)
-from vllm.tool_parsers.iquest_q1_tool_parser import IQuestQ1ToolParser
 
 CALL_START = "<iquest_tool_call>"
 CALL_END = "</iquest_tool_call>"

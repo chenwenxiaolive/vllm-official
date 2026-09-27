@@ -1012,7 +1012,7 @@ class SpecDecodeBaseProposer:
                     "KimiK3MTPModel",
                 }.intersection(architectures)
             )
-        return self.method not in ("mtp", "mtp_recursive", "draft_model", "dflash")
+        return self.method not in ("mtp", "draft_model", "dflash")
 
     def prepare_next_token_ids_cpu(
         self,

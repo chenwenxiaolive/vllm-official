@@ -32,6 +32,36 @@ from .model import IQuestQ1Attention, IQuestQ1MoEBlock, IQuestQ1RMSNorm
 logger = init_logger(__name__)
 
 
+def validate_recursive_draft(speculative_config) -> None:
+    """Validate the recursive checkpoint after vLLM's EAGLE config wrapping."""
+    if speculative_config.method != "eagle":
+        raise ValueError(
+            "IQuestQ1 recursive MTP requires method='eagle' in the model plugin"
+        )
+    if speculative_config.parallel_drafting:
+        raise ValueError("IQuestQ1 recursive MTP requires serial drafting")
+    draft = speculative_config.draft_model_config.hf_config
+    original = getattr(draft, "model", draft)
+    target = speculative_config.target_model_config.hf_config
+    if (
+        original.model_type != "iquest_q1_mtp_recursive"
+        or target.model_type != "iquest_q1"
+    ):
+        raise ValueError(
+            "Recursive MTP requires an IQuestQ1 target and "
+            "iquest_q1_mtp_recursive checkpoint"
+        )
+    if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
+        raise ValueError(
+            "Recursive draft hidden size and vocabulary must match the target"
+        )
+    if speculative_config.num_speculative_tokens > draft.num_draft_slots:
+        logger.warning(
+            "Recursive MTP depth exceeds the checkpoint's trained num_draft_slots=%d",
+            draft.num_draft_slots,
+        )
+
+
 class IQuestQ1RecursiveInnerLayer(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -145,6 +175,7 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
         super().__init__()
         vllm_config = copy(vllm_config)
         assert vllm_config.speculative_config is not None
+        validate_recursive_draft(vllm_config.speculative_config)
         vllm_config.model_config = vllm_config.speculative_config.draft_model_config
         vllm_config.quant_config = get_draft_quant_config(vllm_config)
         self.config = vllm_config.model_config.hf_config
@@ -179,9 +210,11 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert hidden_states is not None
-        return self.model(input_ids, positions, hidden_states, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds)
+        # EAGLE consumes separate logits and feedback states; ours are identical.
+        return hidden_states, hidden_states
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)

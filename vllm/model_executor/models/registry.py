@@ -139,7 +139,6 @@ _TEXT_GENERATION_MODELS = {
     "InternLM3ForCausalLM": ("llama", "LlamaForCausalLM"),
     "IQuestCoderForCausalLM": ("llama", "LlamaForCausalLM"),
     "IQuestLoopCoderForCausalLM": ("iquest_loopcoder", "IQuestLoopCoderForCausalLM"),
-    "IQuestQ1ForCausalLM": ("vllm.models.iquest_q1", "IQuestQ1ForCausalLM"),
     "Jais2ForCausalLM": ("jais2", "Jais2ForCausalLM"),
     "JambaForCausalLM": ("jamba", "JambaForCausalLM"),
     "K2HorizonForCausalLM": ("k2_horizon", "K2HorizonForCausalLM"),
@@ -625,10 +624,6 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
-    "IQuestQ1MTPRecursive": (
-        "vllm.models.iquest_q1.mtp_recursive",
-        "IQuestQ1MTPRecursive",
-    ),
     "ExtractHiddenStatesModel": ("extract_hidden_states", "ExtractHiddenStatesModel"),
     "MiMoMTPModel": ("mimo_mtp", "MiMoMTP"),
     "MiMoV2MTPModel": ("mimo_v2_mtp", "MiMoV2MTP"),

@@ -4,8 +4,7 @@
 from unittest.mock import Mock
 
 import pytest
-
-from vllm.reasoning.iquest_q1_reasoning_parser import (
+from vllm_iquest_q1.reasoning_parser import (
     IQuestQ1ReasoningParser,
 )
 

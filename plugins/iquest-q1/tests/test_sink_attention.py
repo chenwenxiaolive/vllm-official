@@ -28,7 +28,7 @@ except ImportError:
 @torch.inference_mode()
 def test_sink_preserves_fp32_eager_rounding(num_tokens, output_dtype, strided):
     """The sink correction must preserve rounding and leave padded rows untouched."""
-    from vllm.models.iquest_q1.attention import apply_sink_key
+    from vllm_iquest_q1.attention import apply_sink_key
 
     set_random_seed(42)
     num_heads, num_kv_heads, head_size = 6, 2, 128
@@ -84,7 +84,8 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
 
     from types import SimpleNamespace
 
-    from vllm.models.iquest_q1.attention import IQuestFlashAttentionImpl
+    from vllm_iquest_q1.attention import IQuestFlashAttentionImpl
+
     from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 
     set_random_seed(0)

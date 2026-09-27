@@ -8,8 +8,56 @@ import pytest
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm_iquest_q1 import mtp_recursive
+from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
 
-from vllm.models.iquest_q1 import mtp_recursive
+from vllm.transformers_utils.configs.eagle import EAGLEConfig
+
+
+def _speculative_config():
+    target = IQuestQ1Config()
+    draft = IQuestQ1MTPRecursiveConfig(
+        target_config=target.to_dict(), architectures=["IQuestQ1MtpRecursive"]
+    )
+    return SimpleNamespace(
+        method="eagle",
+        parallel_drafting=False,
+        num_speculative_tokens=7,
+        target_model_config=SimpleNamespace(hf_config=target),
+        draft_model_config=SimpleNamespace(
+            hf_config=EAGLEConfig(draft, method="eagle", model_type="eagle")
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value,error",
+    [
+        ("method", "eagle3", "requires method='eagle'"),
+        ("parallel_drafting", True, "serial drafting"),
+        ("hidden_size", 4096, "must match"),
+        ("vocab_size", 32000, "must match"),
+        ("model_type", "llama", "IQuestQ1 target"),
+    ],
+)
+def test_recursive_plugin_rejects_incompatible_target_or_proposer(field, value, error):
+    config = _speculative_config()
+    mtp_recursive.validate_recursive_draft(config)
+    obj = config if hasattr(config, field) else config.target_model_config.hf_config
+    setattr(obj, field, value)
+    with pytest.raises(ValueError, match=error):
+        mtp_recursive.validate_recursive_draft(config)
+
+
+def test_recursive_eagle_returns_same_normalized_state_for_logits_and_feedback():
+    """The EAGLE tuple must preserve the previous single-tensor feedback rule."""
+    expected = torch.randn(3, 4)
+    draft = SimpleNamespace(model=lambda *args: expected)
+    logits_state, feedback = mtp_recursive.IQuestQ1MTPRecursive.forward(
+        draft, torch.tensor([1, 2, 3]), torch.arange(3), torch.randn(3, 4)
+    )
+    assert logits_state is expected
+    assert feedback is expected
 
 
 class _Attention(nn.Module):

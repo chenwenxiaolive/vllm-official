@@ -769,6 +769,11 @@ class IQuestQ1ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         layer_type: type[nn.Module] = IQuestQ1DecoderLayer,
     ):
         super().__init__()
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.method == "mtp":
+            raise ValueError(
+                "IQuestQ1 requires method='eagle' with a standalone recursive draft"
+            )
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config

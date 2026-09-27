@@ -3,17 +3,17 @@
 """IQuestQ1 hybrid configuration, routing precision, and checkpoint layout tests."""
 
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
-
-from vllm.config import ModelConfig
-from vllm.config.speculative import SpeculativeConfig
-from vllm.models.iquest_q1 import model as iquest_model
-from vllm.models.iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
-from vllm.models.iquest_q1.model import (
+from vllm_iquest_q1 import model as iquest_model
+from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
+from vllm_iquest_q1.model import (
     IQuestQ1Attention,
     IQuestQ1ForCausalLM,
     IQuestQ1Model,
@@ -21,7 +21,46 @@ from vllm.models.iquest_q1.model import (
     IQuestQ1RMSNorm,
     get_layer_sliding_window_size,
 )
+
+from vllm.config.speculative import SpeculativeConfig
 from vllm.transformers_utils.config import get_config
+
+
+@pytest.mark.cpu_test
+def test_installed_entry_point_registers_models_and_parsers_in_fresh_process():
+    """Workers must discover the plugin without in-tree registry hooks."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from types import SimpleNamespace
+import torch
+from transformers import AutoConfig
+from vllm import ModelRegistry
+from vllm.plugins import load_general_plugins
+from vllm.reasoning import ReasoningParserManager
+from vllm.tool_parsers import ToolParserManager
+load_general_plugins()
+from vllm_iquest_q1 import register
+register()
+assert 'vllm_iquest_q1.model' not in sys.modules
+assert 'vllm_iquest_q1.mtp_recursive' not in sys.modules
+assert not torch.cuda.is_initialized()
+assert AutoConfig.for_model('iquest_q1').num_hidden_layers == 88
+assert AutoConfig.for_model('iquest_q1_mtp_recursive').num_hidden_layers == 1
+for arch in ('IQuestQ1ForCausalLM', 'EagleIQuestQ1MtpRecursive'):
+    cls, _ = ModelRegistry.resolve_model_cls([arch], SimpleNamespace(model_impl="vllm"))
+    assert cls.__module__.startswith('vllm_iquest_q1.')
+assert ReasoningParserManager.get_reasoning_parser('iquest_q1')
+assert ToolParserManager.get_tool_parser('iquest_q1')
+""",
+        ],
+        env={**os.environ, "VLLM_PLUGINS": "iquest_q1"},
+        check=True,
+        timeout=60,
+    )
 
 
 @pytest.mark.cpu_test
@@ -48,7 +87,7 @@ def test_recursive_draft_preserves_own_attention_config(tmp_path):
     assert loaded.target_config["sliding_window"] == 4096
     assert loaded.num_draft_slots == 7
     assert SpeculativeConfig.hf_config_override(loaded).architectures == [
-        "IQuestQ1MTPRecursive"
+        "IQuestQ1MtpRecursive"
     ]
 
 
@@ -165,25 +204,6 @@ def test_layer_windows_match_checkpoint_pattern(layer_idx, expected):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("explicit_draft", [False, True])
-def test_native_mtp_rejected_before_loading_draft(tmp_path, explicit_draft):
-    """Legacy checkpoint metadata must not enable the removed native MTP path."""
-    config = IQuestQ1Config(architectures=["IQuestQ1ForCausalLM"], num_mtp_layers=2)
-    config.save_pretrained(tmp_path)
-    target = ModelConfig(model=str(tmp_path), skip_tokenizer_init=True)
-    with pytest.raises(ValueError, match="use method='mtp_recursive'"):
-        SpeculativeConfig(
-            method="mtp",
-            model=str(tmp_path) if explicit_draft else None,
-            num_speculative_tokens=2,
-            target_model_config=target,
-        )
-    assert SpeculativeConfig.hf_config_override(config).architectures == [
-        "IQuestQ1ForCausalLM"
-    ]
-
-
-@pytest.mark.cpu_test
 def test_invalid_hybrid_pattern_fails_before_weight_loading():
     with pytest.raises(ValueError, match="hybrid layer pattern"):
         IQuestQ1Config(num_hidden_layers=87)
@@ -278,11 +298,12 @@ def test_invalid_router_dtype_is_rejected():
 @pytest.mark.parametrize("model_dtype", [torch.bfloat16, torch.float16])
 def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_dtype):
     """The draft must not inherit the target head's FP32 flag or global dtype."""
+    from vllm_iquest_q1 import mtp_recursive
+
     from vllm.model_executor.layers import logits_processor
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         UnquantizedEmbeddingMethod,
     )
-    from vllm.models.iquest_q1 import mtp_recursive
 
     target = IQuestQ1Config(
         hidden_size=16, vocab_size=8, enable_lm_head_fp32=True if draft else enable_fp32
@@ -298,7 +319,13 @@ def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_
     vllm_config = SimpleNamespace(
         model_config=model_config,
         quant_config=None,
-        speculative_config=SimpleNamespace(draft_model_config=model_config),
+        speculative_config=SimpleNamespace(
+            draft_model_config=model_config,
+            target_model_config=SimpleNamespace(hf_config=target),
+            method="eagle",
+            parallel_drafting=False,
+            num_speculative_tokens=7,
+        ),
         compilation_config=SimpleNamespace(mode=0),
     )
     backbone = nn.Identity()
