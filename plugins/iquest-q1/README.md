@@ -33,12 +33,14 @@ To enable recursive MTP, append:
 --speculative-config '{
   "method": "eagle",
   "model": "/path/to/draft",
-  "num_speculative_tokens": 7
+  "num_speculative_tokens": 5,
+  "draft_sample_method": "probabilistic",
+  "rejection_sample_method": "standard"
 }'
 ```
 
-Set `num_speculative_tokens` to the draft's `num_draft_slots`. Only serial
-drafting is supported; target and draft hidden sizes and vocabularies must match.
+Only serial drafting is supported; target and draft hidden sizes and
+vocabularies must match.
 
 ## Development
 
