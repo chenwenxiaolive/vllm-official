@@ -17,6 +17,9 @@ def register() -> None:
     from vllm.tool_parsers import ToolParserManager
 
     from .configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
+    from .runtime_hooks import install_recursive_proposer_hooks
+
+    install_recursive_proposer_hooks()
 
     for config in (IQuestQ1Config, IQuestQ1MTPRecursiveConfig):
         AutoConfig.register(config.model_type, config, exist_ok=True)

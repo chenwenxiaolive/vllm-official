@@ -45,6 +45,13 @@ from vllm.tool_parsers import ToolParserManager
 load_general_plugins()
 from vllm_iquest_q1 import register
 register()
+from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+from vllm_iquest_q1.runtime_hooks import install_recursive_proposer_hooks
+hooks = (EagleProposer.propose, EagleSpeculator.propose)
+install_recursive_proposer_hooks()
+assert hooks == (EagleProposer.propose, EagleSpeculator.propose)
+assert all(getattr(hook, '_iquest_recursive_hook', False) for hook in hooks)
 assert 'vllm_iquest_q1.model' not in sys.modules
 assert 'vllm_iquest_q1.mtp_recursive' not in sys.modules
 assert not torch.cuda.is_initialized()
@@ -327,6 +334,10 @@ def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_
             num_speculative_tokens=7,
         ),
         compilation_config=SimpleNamespace(mode=0),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        kv_transfer_config=None,
+        parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=1),
+        use_v2_model_runner=False,
     )
     backbone = nn.Identity()
     backbone.layer_idx = 88
@@ -488,3 +499,35 @@ def test_expert_checkpoint_splits_gate_up_and_maps_down_weights():
         torch.testing.assert_close(loaded[w13, "w1", expert], fc[expert, :3])
         torch.testing.assert_close(loaded[w13, "w3", expert], fc[expert, 3:])
         torch.testing.assert_close(loaded[w2, "w2", expert], proj[expert])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 3072), (2, 3072), (7, 3072), (16, 3072), (32, 3072), (1, 6, 128), (7, 6, 128)],
+)
+def test_draft_decode_norm_preserves_reduction_order_and_replays_inputs(dtype, shape):
+    """Decode fusion must not perturb draft logits through norm rounding."""
+    torch.manual_seed(173)
+    size = shape[-1]
+    raw = torch.randn((*shape[:-1], size + 37), dtype=dtype, device="cuda")
+    x = raw[..., 3 : 3 + size]
+    norm = IQuestQ1RMSNorm(size).to(device="cuda", dtype=torch.bfloat16)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn_like(norm.weight))
+        expected = norm(x)
+        norm.use_decode_kernel = True
+        actual = norm(x)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = norm(x)
+        torch.cuda.current_stream().wait_stream(stream)
+        x.mul_(0.125)
+        norm.weight.add_(0.01)
+        graph.replay()
+        norm.use_decode_kernel = False
+        torch.testing.assert_close(output, norm(x), rtol=0, atol=0)

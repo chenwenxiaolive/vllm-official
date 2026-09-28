@@ -108,8 +108,15 @@ class IQuestQ1RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
+        self.use_decode_kernel = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.use_decode_kernel and not torch.compiler.is_compiling():
+            from .draft_ops import decode_rms_norm
+
+            output = decode_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+            if output is not None:
+                return output
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -364,19 +371,26 @@ class IQuestQ1Attention(nn.Module):
             attn_cls = IQuestAttention
             sink_args["sink_key"] = self.sink_k
 
-        self.attn = attn_cls(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            cache_config=self.cache_config,
-            per_layer_sliding_window=real_sliding_window,
-            quant_config=quant_config,
-            attn_type=AttentionType.DECODER,
-            kv_sharing_target_layer_name=kv_sharing_target_layer_name,
-            prefix=f"{prefix}.attn",
-            **sink_args,
-        )
+        def make_attention(name):
+            attention = attn_cls(
+                self.num_heads,
+                self.head_dim,
+                self.scaling,
+                num_kv_heads=self.num_kv_heads,
+                cache_config=self.cache_config,
+                per_layer_sliding_window=real_sliding_window,
+                quant_config=quant_config,
+                attn_type=AttentionType.DECODER,
+                kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+                prefix=name,
+                **sink_args,
+            )
+            if is_mtp_layer:
+                # Verification can rewind draft positions; keep their KV blocks.
+                attention.sliding_window = None
+            return attention
+
+        self.attn = make_attention(f"{prefix}.attn")
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)
@@ -389,7 +403,9 @@ class IQuestQ1Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        attention = self.attn
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         # Add qk-norm
@@ -400,7 +416,7 @@ class IQuestQ1Attention(nn.Module):
         if self.cross_kv_cache:
             if self.rotary_emb is not None:
                 q, _ = self.rotary_emb(positions, q, None)
-            attn_output = self.attn(q, None, None)
+            attn_output = attention(q, None, None)
         else:
             k_by_head = k.view(
                 *k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim
@@ -411,7 +427,7 @@ class IQuestQ1Attention(nn.Module):
 
             if self.rotary_emb:
                 q, k = self.rotary_emb(positions, q, k)
-            attn_output = self.attn(q, k, v)
+            attn_output = attention(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 

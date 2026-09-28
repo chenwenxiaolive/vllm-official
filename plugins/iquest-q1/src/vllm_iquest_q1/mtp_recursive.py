@@ -100,9 +100,13 @@ class IQuestQ1RecursiveInnerLayer(nn.Module):
         self.ffn_out_scale = getattr(config, "first_layer_ffn_out_scale", 1.0)
         self.fp32_residual_connection = config.fp32_residual_connection
 
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+    def forward(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor, spec_step_idx=0
+    ):
         dtype = hidden_states.dtype
-        attention = self.self_attn(positions, self.attention_norm(hidden_states))
+        attention = self.self_attn(
+            positions, self.attention_norm(hidden_states), spec_step_idx=spec_step_idx
+        )
         residual = (
             hidden_states.float() if self.fp32_residual_connection else hidden_states
         )
@@ -124,7 +128,7 @@ class IQuestQ1RecursiveLayer(nn.Module):
         )
         self.final_layernorm = IQuestQ1RMSNorm(config.hidden_size, config.rms_norm_eps)
 
-    def forward(self, positions, hidden_states, inputs_embeds):
+    def forward(self, positions, hidden_states, inputs_embeds, spec_step_idx=0):
         dtype = self.eh_proj.weight.dtype
         hidden_states = self.eh_proj(
             torch.cat(
@@ -135,7 +139,7 @@ class IQuestQ1RecursiveLayer(nn.Module):
                 dim=-1,
             )
         )
-        hidden_states = self.mtp_model_layer(positions, hidden_states)
+        hidden_states = self.mtp_model_layer(positions, hidden_states, spec_step_idx)
         return self.final_layernorm(hidden_states).to(dtype)
 
 
@@ -158,10 +162,14 @@ class IQuestQ1RecursivePredictor(nn.Module):
             }
         )
 
-    def forward(self, input_ids, positions, hidden_states, inputs_embeds=None):
+    def forward(
+        self, input_ids, positions, hidden_states, inputs_embeds=None, spec_step_idx=0
+    ):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-        return self.layers[str(self.layer_idx)](positions, hidden_states, inputs_embeds)
+        return self.layers[str(self.layer_idx)](
+            positions, hidden_states, inputs_embeds, spec_step_idx
+        )
 
 
 @support_torch_compile
@@ -170,18 +178,41 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
 
     has_own_embed_tokens = True
     has_own_lm_head = True
+    _iquest_recursive_proposal = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         vllm_config = copy(vllm_config)
         assert vllm_config.speculative_config is not None
         validate_recursive_draft(vllm_config.speculative_config)
+        if vllm_config.kv_transfer_config is not None:
+            raise ValueError("Recursive MTP does not support external KV transfer")
+        parallel = vllm_config.parallel_config
+        if parallel.data_parallel_size > 1 or parallel.pipeline_parallel_size > 1:
+            raise ValueError("Recursive MTP currently requires DP=1 and PP=1")
+        if vllm_config.use_v2_model_runner:
+            from vllm.v1.worker.gpu.spec_decode.eagle.speculator import EagleSpeculator
+
+            proposer_class = EagleSpeculator
+        else:
+            from vllm.v1.spec_decode.eagle import EagleProposer
+
+            proposer_class = EagleProposer
+        if not getattr(proposer_class.propose, "_iquest_recursive_hook", False):
+            raise ValueError(
+                "IQuest-Q1 recursive MTP runtime hooks are not installed; "
+                "load the iquest_q1 plugin in every worker environment"
+            )
+        self._recursive_proposer = None
         vllm_config.model_config = vllm_config.speculative_config.draft_model_config
         vllm_config.quant_config = get_draft_quant_config(vllm_config)
         self.config = vllm_config.model_config.hf_config
         self.model = IQuestQ1RecursivePredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        for module in self.model.modules():
+            if isinstance(module, IQuestQ1RMSNorm):
+                module.use_decode_kernel = True
         self.mtp_start_layer_idx = self.model.layer_idx
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
@@ -212,9 +243,21 @@ class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
         spec_step_idx: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert hidden_states is not None
-        hidden_states = self.model(input_ids, positions, hidden_states, inputs_embeds)
+        hidden_states = self.model(
+            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
+        )
         # EAGLE consumes separate logits and feedback states; ours are identical.
         return hidden_states, hidden_states
+
+    def propose_draft(self, proposer, **kwargs):
+        from .recursive_proposer import RecursiveProposer, RecursiveProposerV2
+
+        if self._recursive_proposer is None:
+            factory = (
+                RecursiveProposerV2 if "input_batch" in kwargs else RecursiveProposer
+            )
+            self._recursive_proposer = factory(self, proposer)
+        return self._recursive_proposer.propose(**kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
