@@ -9,15 +9,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from vllm_iquest_q1 import mtp_recursive
-from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
+from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPConfig
 
 from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
 
 def _speculative_config():
     target = IQuestQ1Config()
-    draft = IQuestQ1MTPRecursiveConfig(
-        target_config=target.to_dict(), architectures=["IQuestQ1MtpRecursive"]
+    draft = IQuestQ1MTPConfig(
+        target_config=target.to_dict(), architectures=["IQuestQ1MTP"]
     )
     return SimpleNamespace(
         method="eagle",
