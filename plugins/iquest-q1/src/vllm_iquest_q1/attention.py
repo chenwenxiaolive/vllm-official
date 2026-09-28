@@ -99,7 +99,8 @@ def apply_sink_key(
     if num_tokens == 0:
         return
     num_heads, head_size = query.shape[1:]
-    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, 4),)](
+    block_rows = 64 if num_tokens * num_heads >= 32768 else 4
+    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, block_rows),)](
         query,
         sink_key,
         output,
@@ -113,7 +114,7 @@ def apply_sink_key(
         QUERIES_PER_KV=num_heads // sink_key.shape[0],
         HEAD_SIZE=head_size,
         SCALE=scale,
-        BLOCK_ROWS=4,
+        BLOCK_ROWS=block_rows,
         BLOCK_D=triton.next_power_of_2(head_size),
         num_warps=4,
         enable_fp_fusion=False,
