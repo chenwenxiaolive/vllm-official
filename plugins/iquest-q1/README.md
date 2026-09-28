@@ -56,6 +56,8 @@ To enable recursive MTP, append:
 The draft's `model` is configured separately. Use its local directory or its
 own Hugging Face repository ID; the target repository does not select a draft
 automatically.
+The release draft uses `model_type: iquest_q1_mtp` and architecture
+`IQuestQ1MTP`.
 
 Only serial drafting is supported; target and draft hidden sizes and
 vocabularies must match. One draft layer recursively reuses its weights and a

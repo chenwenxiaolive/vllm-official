@@ -12,7 +12,7 @@ import pytest
 import torch
 from torch import nn
 from vllm_iquest_q1 import model as iquest_model
-from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPRecursiveConfig
+from vllm_iquest_q1.configs import IQuestQ1Config, IQuestQ1MTPConfig
 from vllm_iquest_q1.model import (
     IQuestQ1Attention,
     IQuestQ1ForCausalLM,
@@ -56,8 +56,8 @@ assert 'vllm_iquest_q1.model' not in sys.modules
 assert 'vllm_iquest_q1.mtp_recursive' not in sys.modules
 assert not torch.cuda.is_initialized()
 assert AutoConfig.for_model('iquest_q1').num_hidden_layers == 88
-assert AutoConfig.for_model('iquest_q1_mtp_recursive').num_hidden_layers == 1
-for arch in ('IQuestQ1ForCausalLM', 'EagleIQuestQ1MtpRecursive'):
+assert AutoConfig.for_model('iquest_q1_mtp').num_hidden_layers == 1
+for arch in ('IQuestQ1ForCausalLM', 'IQuestQ1MTP', 'EagleIQuestQ1MTP'):
     cls, _ = ModelRegistry.resolve_model_cls([arch], SimpleNamespace(model_impl="vllm"))
     assert cls.__module__.startswith('vllm_iquest_q1.')
 assert ReasoningParserManager.get_reasoning_parser('iquest_q1')
@@ -72,11 +72,11 @@ assert ToolParserManager.get_tool_parser('iquest_q1')
 
 @pytest.mark.cpu_test
 def test_recursive_draft_preserves_own_attention_config(tmp_path):
-    target = IQuestQ1Config()
+    target = IQuestQ1Config(enable_lm_head_fp32=True)
     config = dict(
-        model_type="iquest_q1_mtp_recursive",
+        model_type="iquest_q1_mtp",
         target_config=target.to_dict(),
-        architectures=["IQuestQ1MtpRecursive"],
+        architectures=["IQuestQ1MTP"],
         sliding_window=512,
         swa_rope_theta=10000.0,
         num_draft_slots=7,
@@ -84,7 +84,7 @@ def test_recursive_draft_preserves_own_attention_config(tmp_path):
     )
     (tmp_path / "config.json").write_text(json.dumps(config))
     loaded = get_config(str(tmp_path), trust_remote_code=False)
-    assert loaded.model_type == "iquest_q1_mtp_recursive"
+    assert loaded.model_type == "iquest_q1_mtp"
     assert loaded.num_hidden_layers == 1
     assert loaded.layer_types == ["sliding_attention"]
     assert loaded.sliding_window == 512
@@ -92,10 +92,10 @@ def test_recursive_draft_preserves_own_attention_config(tmp_path):
     assert loaded.fp32_residual_connection
     assert loaded.target_config["num_hidden_layers"] == 88
     assert loaded.target_config["sliding_window"] == 4096
+    assert loaded.target_config["enable_lm_head_fp32"]
+    assert not loaded.enable_lm_head_fp32
     assert loaded.num_draft_slots == 7
-    assert SpeculativeConfig.hf_config_override(loaded).architectures == [
-        "IQuestQ1MtpRecursive"
-    ]
+    assert SpeculativeConfig.hf_config_override(loaded).architectures == ["IQuestQ1MTP"]
 
 
 @pytest.mark.cpu_test
@@ -112,7 +112,7 @@ def test_recursive_draft_preserves_own_attention_config(tmp_path):
 )
 def test_recursive_config_rejects_unsupported_drafts(kwargs):
     with pytest.raises(ValueError):
-        IQuestQ1MTPRecursiveConfig(**kwargs)
+        IQuestQ1MTPConfig(**kwargs)
 
 
 @pytest.mark.cpu_test
@@ -135,7 +135,7 @@ def test_recursive_attention_uses_draft_window_and_rope(monkeypatch, window):
         monkeypatch.setattr(iquest_model, name, lambda *a, **kw: nn.Identity())
     monkeypatch.setattr(iquest_model, "Attention", attention)
     monkeypatch.setattr(iquest_model, "get_rope", rope)
-    config = IQuestQ1MTPRecursiveConfig(
+    config = IQuestQ1MTPConfig(
         target_config=IQuestQ1Config(enable_sink_attention=False).to_dict(),
         sliding_window=window,
         swa_rope_theta=10000.0,
@@ -317,7 +317,7 @@ def test_lm_head_precision_uses_own_flag(monkeypatch, draft, enable_fp32, model_
     )
     config = target
     if draft:
-        config = IQuestQ1MTPRecursiveConfig(
+        config = IQuestQ1MTPConfig(
             target_config=target.to_dict(),
             **({"enable_lm_head_fp32": True} if enable_fp32 else {}),
         )

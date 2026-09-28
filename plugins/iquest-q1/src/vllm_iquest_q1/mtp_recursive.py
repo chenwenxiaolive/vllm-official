@@ -43,13 +43,10 @@ def validate_recursive_draft(speculative_config) -> None:
     draft = speculative_config.draft_model_config.hf_config
     original = getattr(draft, "model", draft)
     target = speculative_config.target_model_config.hf_config
-    if (
-        original.model_type != "iquest_q1_mtp_recursive"
-        or target.model_type != "iquest_q1"
-    ):
+    if original.model_type != "iquest_q1_mtp" or target.model_type != "iquest_q1":
         raise ValueError(
             "Recursive MTP requires an IQuestQ1 target and "
-            "iquest_q1_mtp_recursive checkpoint"
+            "an IQuestQ1 recursive MTP checkpoint"
         )
     if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
         raise ValueError(

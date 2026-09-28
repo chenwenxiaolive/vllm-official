@@ -86,7 +86,7 @@ def _install_prefill_lookahead_hook(config_class: type) -> None:
         draft = getattr(spec, "draft_model_config", None)
         config = getattr(draft, "hf_config", None)
         config = getattr(config, "model", config)
-        if getattr(config, "model_type", None) == "iquest_q1_mtp_recursive":
+        if getattr(config, "model_type", None) == "iquest_q1_mtp":
             return spec.num_speculative_tokens
         return original(self)
 
