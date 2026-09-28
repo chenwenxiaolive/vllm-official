@@ -19,13 +19,20 @@ If `VLLM_PLUGINS` is set, include `iquest_q1` in the list.
 ## Serving
 
 ```bash
-vllm serve /path/to/target \
+vllm serve IQuestLab/IQuest-Q1 \
   --served-model-name iquest-q1 \
   --tensor-parallel-size 8 \
   --reasoning-parser iquest_q1 \
   --enable-auto-tool-choice \
   --tool-call-parser iquest_q1
 ```
+
+This downloads the target model from the Hugging Face repository
+`IQuestLab/IQuest-Q1`, reusing the local Hugging Face cache when available.
+Use a local model directory instead to load existing weights. For online
+downloads, do not set `HF_HUB_OFFLINE=1` or `VLLM_USE_MODELSCOPE=1`.
+If `HF_ENDPOINT` is set, use `https://huggingface.co` to download from the
+official Hub. Authenticate with `hf auth login` for a private or gated repo.
 
 The plugin installs runtime hooks for vLLM's V1 `EagleProposer` and V2
 `EagleSpeculator`; no vLLM source changes are required. Only IQuest recursive
@@ -45,6 +52,10 @@ To enable recursive MTP, append:
   "enforce_eager": false
 }'
 ```
+
+The draft's `model` is configured separately. Use its local directory or its
+own Hugging Face repository ID; the target repository does not select a draft
+automatically.
 
 Only serial drafting is supported; target and draft hidden sizes and
 vocabularies must match. One draft layer recursively reuses its weights and a
