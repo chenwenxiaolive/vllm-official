@@ -151,10 +151,10 @@ class IQuestQ1Config(PretrainedConfig):
         super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
 
 
-class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
+class IQuestQ1MTPConfig(IQuestQ1Config):
     """Standalone recursive draft with its own attention configuration."""
 
-    model_type = "iquest_q1_mtp_recursive"
+    model_type = "iquest_q1_mtp"
 
     def __init__(
         self,
@@ -207,4 +207,4 @@ class IQuestQ1MTPRecursiveConfig(IQuestQ1Config):
         self.draft_type = draft_type
 
 
-__all__ = ["IQuestQ1Config", "IQuestQ1MTPRecursiveConfig"]
+__all__ = ["IQuestQ1Config", "IQuestQ1MTPConfig"]

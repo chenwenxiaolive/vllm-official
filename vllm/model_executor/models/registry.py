@@ -625,9 +625,9 @@ _MULTIMODAL_MODELS = {
 }
 
 _SPECULATIVE_DECODING_MODELS = {
-    "IQuestQ1MTPRecursive": (
+    "IQuestQ1MTP": (
         "vllm.models.iquest_q1.mtp_recursive",
-        "IQuestQ1MTPRecursive",
+        "IQuestQ1MTP",
     ),
     "ExtractHiddenStatesModel": ("extract_hidden_states", "ExtractHiddenStatesModel"),
     "MiMoMTPModel": ("mimo_mtp", "MiMoMTP"),

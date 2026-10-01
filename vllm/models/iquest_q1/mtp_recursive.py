@@ -135,7 +135,7 @@ class IQuestQ1RecursivePredictor(nn.Module):
 
 
 @support_torch_compile
-class IQuestQ1MTPRecursive(nn.Module, SupportsPP):
+class IQuestQ1MTP(nn.Module, SupportsPP):
     """One draft layer recursively feeding its normalized hidden state back."""
 
     has_own_embed_tokens = True

@@ -663,8 +663,8 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
-        if hf_config.model_type == "iquest_q1_mtp_recursive":
-            hf_config.architectures = ["IQuestQ1MTPRecursive"]
+        if hf_config.model_type == "iquest_q1_mtp":
+            hf_config.architectures = ["IQuestQ1MTP"]
         initial_architecture = hf_config.architectures[0]
         use_v32_mtp = hf_config.model_type in ("deepseek_v32", "glm_moe_dsa")
         if hf_config.model_type == "dots3_note":
@@ -1149,7 +1149,7 @@ class SpeculativeConfig:
             and self.target_model_config.hf_config.model_type == "iquest_q1"
         ):
             raise ValueError(
-                "IQuestQ1 does not support method='mtp'; use method='mtp_recursive' "
+                "IQuestQ1 does not support method='mtp'; use method='eagle' "
                 "with a standalone draft checkpoint."
             )
 
@@ -1332,6 +1332,13 @@ class SpeculativeConfig:
                         draft_hf.vocab_size = target_vocab
                         draft_hf.truncated_vocab_size = target_vocab
 
+                if self.draft_model_config.hf_config.model_type == "iquest_q1_mtp":
+                    if self.method not in ("eagle", "mtp_recursive"):
+                        raise ValueError("IQuestQ1 MTP requires method='eagle'")
+                    # The released EAGLE entry point uses one normalized state
+                    # for both logits and recursive feedback.
+                    self.method = "mtp_recursive"
+
                 # Automatically detect the method
                 if self.method in (
                     "eagle",
@@ -1497,12 +1504,12 @@ class SpeculativeConfig:
                     draft_hf = self.draft_model_config.hf_config
                     target_hf = self.target_model_config.hf_config
                     if (
-                        draft_hf.model_type != "iquest_q1_mtp_recursive"
+                        draft_hf.model_type != "iquest_q1_mtp"
                         or target_hf.model_type != "iquest_q1"
                     ):
                         raise ValueError(
                             "mtp_recursive requires an IQuestQ1 target and "
-                            "iquest_q1_mtp_recursive checkpoint"
+                            "iquest_q1_mtp checkpoint"
                         )
                     if self.parallel_drafting:
                         raise ValueError("mtp_recursive requires serial drafting")
