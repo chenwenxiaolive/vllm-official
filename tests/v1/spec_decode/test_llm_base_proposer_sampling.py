@@ -80,7 +80,7 @@ def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():
         ("mtp", "DeepSeekMTPModel", True),
         ("mtp", "KimiK3MTPModel", True),
         ("mtp", "MiniMaxM3ForCausalLM", False),
-        ("mtp_recursive", "IQuestQ1MTPRecursive", False),
+        ("mtp_recursive", "IQuestQ1MTP", False),
     ],
 )
 def test_mtp_model_returns_tuple(method: str, architecture: str, expected: bool):

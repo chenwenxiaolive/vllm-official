@@ -69,13 +69,15 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
 
 ## IQuestQ1 Recursive Drafts
 
-IQuestQ1 supports standalone `iquest_q1_mtp_recursive` checkpoints.
-Select `mtp_recursive` and supply the draft checkpoint:
+IQuestQ1 supports standalone `iquest_q1_mtp` checkpoints with the
+`IQuestQ1MTP` architecture. Select `eagle` and supply the draft checkpoint
+from the model's `mtp` directory. vLLM maps this entry point to its
+recursive MTP implementation:
 
 ```bash
 vllm serve /path/to/iquest-q1 \
     --tensor-parallel-size 8 \
-    --speculative-config '{"method":"mtp_recursive","model":"/path/to/draft","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+    --speculative-config '{"method":"eagle","model":"/path/to/iquest-q1/mtp","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
 ```
 
 The native `method="mtp"` path is not supported for IQuestQ1. Embedded

@@ -174,7 +174,7 @@ def test_recursive_loads_offset_layers_and_fused_weights(fused_experts, fp8):
     draft.config = SimpleNamespace(num_experts=2, intermediate_size=3)
     draft.mtp_start_layer_idx = 42
     draft.named_parameters = lambda: iter(params.items())
-    model_cls = mtp_recursive.IQuestQ1MTPRecursive
+    model_cls = mtp_recursive.IQuestQ1MTP
     loaded = model_cls.load_weights(draft, checkpoint)
 
     assert loaded == set(expected)

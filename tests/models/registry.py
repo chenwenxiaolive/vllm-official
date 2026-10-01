@@ -1796,10 +1796,10 @@ _SPECULATIVE_DECODING_EXAMPLE_MODELS = {
         is_available_online=False,
     ),
     # Placeholder names until the target and standalone draft are published.
-    "IQuestQ1MTPRecursive": _HfExamplesInfo(
+    "IQuestQ1MTP": _HfExamplesInfo(
         "IQuestLab/IQuest-Q1",
         speculative_model="IQuestLab/IQuest-Q1-MTP-Recursive",
-        speculative_method="mtp_recursive",
+        speculative_method="eagle",
         is_available_online=False,
     ),
     "KimiK3MTPModel": _HfExamplesInfo(
