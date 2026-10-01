@@ -80,8 +80,9 @@ def test_recursive_steps_reuse_one_draft_layer(tiny_config, monkeypatch):
 
 
 @pytest.mark.parametrize("fused_experts", [False, True])
-def test_recursive_loads_offset_layers_and_fused_weights(fused_experts):
-    """Standalone weights load with correct layer offsets and expert/QKV shards."""
+@pytest.mark.parametrize("fp8", [False, True])
+def test_recursive_loads_offset_layers_and_fused_weights(fused_experts, fp8):
+    """Load checkpoint shards without requiring runtime FP8 cache scales."""
     params = {}
     checkpoint = []
     expected = {}
@@ -155,6 +156,20 @@ def test_recursive_loads_offset_layers_and_fused_weights(fused_experts):
     checkpoint.append((f"{src}.final_layernorm.weight", norm))
 
     checkpoint.append(("target_final_norm.weight", torch.ones(4)))
+    runtime_scales = {}
+    if fp8:
+        from vllm.model_executor.layers.quantization.fp8 import (
+            Fp8Config,
+            Fp8KVCacheMethod,
+        )
+
+        attention = nn.Module()
+        Fp8KVCacheMethod(Fp8Config()).create_weights(attention)
+        runtime_scales = {
+            f"{dst}.mtp_model_layer.self_attn.attn.{name}": param
+            for name, param in attention.named_parameters()
+        }
+        params.update(runtime_scales)
     draft = nn.Module()
     draft.config = SimpleNamespace(num_experts=2, intermediate_size=3)
     draft.mtp_start_layer_idx = 42
@@ -165,9 +180,9 @@ def test_recursive_loads_offset_layers_and_fused_weights(fused_experts):
     assert loaded == set(expected)
     for name, value in expected.items():
         torch.testing.assert_close(params[name], value, msg=name)
+    for param in runtime_scales.values():
+        assert param.item() == -1.0
 
-    with pytest.raises(ValueError, match="missing weights"):
-        model_cls.load_weights(draft, checkpoint[1:])
     with pytest.raises(ValueError, match="missing QKV"):
         model_cls.load_weights(
             draft,
