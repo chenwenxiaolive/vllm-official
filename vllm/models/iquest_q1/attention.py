@@ -6,12 +6,18 @@ from typing import Any, ClassVar
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention import Attention
-from vllm.triton_utils import tl, tldevice, triton
+from vllm.models.iquest_q1.fp8_attention import fp8_paged_attention
+from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
+from vllm.utils.torch_utils import (
+    canonicalize_singleton_dim_strides,
+    is_quantized_kv_cache,
+)
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends import flash_attn as fa
 from vllm.v1.attention.backends.fa_utils import FA4_HD256_PAGE_SIZE
@@ -61,23 +67,14 @@ def _apply_sink_key_kernel(
         valid,
         0,
     ).to(tl.float32)
-    products = q * sink
-    if HEAD_SIZE == 128:
-        # Match the FP32 eager reduction order for the model's head size.
-        even, odd = tl.split(products.reshape(BLOCK_ROWS, HEAD_SIZE // 2, 2))
-        first, third = tl.split(even.reshape(BLOCK_ROWS, HEAD_SIZE // 4, 2))
-        second, fourth = tl.split(odd.reshape(BLOCK_ROWS, HEAD_SIZE // 4, 2))
-        sink_dot = tl.sum(((first + second) + third) + fourth, axis=1)
-    else:
-        sink_dot = tl.sum(products, axis=1)
-    sink_logit = sink_dot * SCALE
+    sink_logit = tl.sum(q * sink, axis=1) * SCALE
     normal_lse = tl.load(
         lse + heads * lse_stride_h + tokens * lse_stride_t,
         tokens < num_tokens,
         0,
     )
     # Adding a zero-valued sink changes only the softmax denominator.
-    factor = tl.div_rn(1.0, 1.0 + tldevice.exp(sink_logit - normal_lse))
+    factor = tl.sigmoid(normal_lse - sink_logit)
     offsets = (
         tokens[:, None] * output_stride_t
         + heads[:, None] * output_stride_h
@@ -99,7 +96,7 @@ def apply_sink_key(
     if num_tokens == 0:
         return
     num_heads, head_size = query.shape[1:]
-    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, 4),)](
+    _apply_sink_key_kernel[(cdiv(num_tokens * num_heads, 8),)](
         query,
         sink_key,
         output,
@@ -113,10 +110,8 @@ def apply_sink_key(
         QUERIES_PER_KV=num_heads // sink_key.shape[0],
         HEAD_SIZE=head_size,
         SCALE=scale,
-        BLOCK_ROWS=4,
+        BLOCK_ROWS=8,
         BLOCK_D=triton.next_power_of_2(head_size),
-        num_warps=4,
-        enable_fp_fusion=False,
     )
 
 
@@ -135,6 +130,8 @@ class IQuestFlashAttentionBackend(fa.FlashAttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @staticmethod
@@ -152,9 +149,11 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        if self.kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+        if self.kv_cache_dtype not in (
+            IQuestFlashAttentionBackend.supported_kv_cache_dtypes
+        ):
             raise NotImplementedError(
-                "iQuest learned sinks require unquantized KV cache"
+                f"iQuest learned sinks do not support {self.kv_cache_dtype} KV cache"
             )
         if self.attn_type != AttentionType.DECODER:
             raise NotImplementedError("iQuest learned sinks require decoder attention")
@@ -174,6 +173,7 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
                 raise NotImplementedError(
                     "iQuest learned sinks do not support context parallelism"
                 )
+        # Keep the original query for the unquantized learned sink.
         self.supports_quant_query_input = False
 
     def forward(
@@ -206,9 +206,66 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
         num_tokens = attn_metadata.num_actual_tokens
         if num_tokens == 0:
             return output
+        if (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.vllm_flash_attn_version == 3
+            and current_platform.is_device_capability(90)
+            and not self.batch_invariant_enabled
+            and 1 <= num_tokens <= 8
+            and attn_metadata.query_start_loc.shape[0] == 2
+            and self.num_heads == 6
+            and self.num_kv_heads == 1
+            and self.head_size == 128
+            and query.dtype == output.dtype == torch.bfloat16
+            and query.stride(-1) == output.stride(-1) == 1
+            and kv_cache.is_contiguous()
+            and kv_cache.dtype == torch.uint8
+            and layer._q_scale.numel() == 1
+            and layer._k_scale.numel() == 1
+            and layer._v_scale.numel() == 1
+        ):
+            window = self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
+            lse = fp8_paged_attention(
+                query[:num_tokens],
+                kv_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.query_start_loc,
+                layer._q_scale,
+                layer._k_scale,
+                layer._v_scale,
+                output[:num_tokens],
+                window,
+                self.scale,
+            )
+            apply_sink_key(query, layer.sink_key, output, lse, self.scale, num_tokens)
+            return output
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
+        attn_query = query[:num_tokens]
+        q_descale = k_descale = v_descale = None
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            key_cache = key_cache.view(current_platform.fp8_dtype())
+            value_cache = value_cache.view(current_platform.fp8_dtype())
+            group_size = (
+                self.num_queries_per_kv * self.head_size
+                if layer._q_scale.numel() > 1
+                else -1
+            )
+            attn_query, _ = ops.scaled_fp8_quant(
+                attn_query.reshape(num_tokens, -1).contiguous(),
+                layer._q_scale,
+                group_shape=(-1, group_size),
+            )
+            attn_query = attn_query.view(num_tokens, self.num_heads, self.head_size)
+            descale_shape = (
+                attn_metadata.query_start_loc.shape[0] - 1,
+                self.num_kv_heads,
+            )
+            q_descale = layer._q_scale.expand(descale_shape)
+            k_descale = layer._k_scale.expand(descale_shape)
+            v_descale = layer._v_scale.expand(descale_shape)
         max_seq_len = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
         num_splits = attn_metadata.max_num_splits
@@ -219,7 +276,7 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
             num_splits = 1
         assert self.vllm_flash_attn_version is not None
         _, lse = fa.flash_attn_varlen_func(
-            q=query[:num_tokens],
+            q=attn_query,
             k=key_cache,
             v=value_cache,
             out=output[:num_tokens],
@@ -234,6 +291,9 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
             scheduler_metadata=attn_metadata.scheduler_metadata,
             fa_version=self.vllm_flash_attn_version,
             num_splits=num_splits,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
             return_softmax_lse=True,
         )
         apply_sink_key(query, layer.sink_key, output, lse, self.scale, num_tokens)

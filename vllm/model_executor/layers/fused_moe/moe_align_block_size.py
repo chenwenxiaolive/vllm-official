@@ -6,8 +6,90 @@ from typing import Literal, overload
 import torch
 
 from vllm import _custom_ops as ops
-from vllm.triton_utils import triton
+from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
+
+
+@triton.jit
+def _small_batch_max(a, b):
+    return tl.maximum(a, b)
+
+
+@triton.jit
+def _moe_align_small_batch_kernel(
+    TOPK_IDS,
+    SORTED_IDS,
+    EXPERT_IDS,
+    NUM_PADDED,
+    NUM_ITEMS: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    IGNORE_INVALID: tl.constexpr,
+):
+    SIZE: tl.constexpr = triton.next_power_of_2(NUM_ITEMS)
+    tl.static_assert((NUM_EXPERTS + 1) * SIZE < 2147483647)
+    offsets = tl.arange(0, SIZE)
+    experts = tl.load(TOPK_IDS + offsets, offsets < NUM_ITEMS, 0).to(tl.int32)
+    valid_expert = (experts >= 0) & (experts < NUM_EXPERTS)
+    active = offsets < NUM_ITEMS
+    if IGNORE_INVALID:
+        active &= valid_expert
+    experts = tl.where(valid_expert, experts, NUM_EXPERTS)
+    keys = tl.where(active, experts * SIZE + offsets, 2147483647)
+    ordered = tl.sort(keys, descending=False)
+    experts = ordered // SIZE
+    tokens = ordered % SIZE
+    valid = ordered != 2147483647
+    previous = tl.gather(experts, tl.maximum(offsets - 1, 0), axis=0)
+    starts = valid & ((offsets == 0) | (experts != previous))
+    first = tl.associative_scan(
+        tl.where(starts, offsets, 0), axis=0, combine_fn=_small_batch_max
+    )
+    within_expert = offsets - first
+    block_starts = valid & (within_expert % BLOCK_SIZE == 0)
+    block = tl.cumsum(block_starts.to(tl.int32)) - 1
+    fill_offsets = tl.arange(0, triton.next_power_of_2(NUM_ITEMS * BLOCK_SIZE))
+    tl.store(
+        SORTED_IDS + fill_offsets, NUM_ITEMS, fill_offsets < NUM_ITEMS * BLOCK_SIZE
+    )
+    tl.debug_barrier()
+    tl.store(
+        SORTED_IDS + block * BLOCK_SIZE + within_expert % BLOCK_SIZE, tokens, valid
+    )
+    tl.store(
+        EXPERT_IDS + block,
+        tl.where(experts < NUM_EXPERTS, experts, -1),
+        block_starts,
+    )
+    tl.store(NUM_PADDED, tl.sum(block_starts.to(tl.int32)) * BLOCK_SIZE)
+
+
+def moe_align_small_batch(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    ignore_invalid_experts: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Group up to 64 routed rows in one thread block."""
+    num_items = topk_ids.numel()
+    assert 0 < num_items <= 64 and topk_ids.is_contiguous()
+    sorted_ids = torch.empty(
+        (num_items * block_size,), device=topk_ids.device, dtype=torch.int32
+    )
+    expert_ids = torch.empty((num_items,), device=topk_ids.device, dtype=torch.int32)
+    num_padded = torch.empty((1,), device=topk_ids.device, dtype=torch.int32)
+    _moe_align_small_batch_kernel[(1,)](
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        num_padded,
+        num_items,
+        num_experts,
+        block_size,
+        ignore_invalid_experts,
+        num_warps=4,
+    )
+    return sorted_ids, expert_ids, num_padded
 
 
 @overload

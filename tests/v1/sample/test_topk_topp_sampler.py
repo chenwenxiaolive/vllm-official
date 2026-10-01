@@ -389,6 +389,45 @@ class TestTritonTopkTopp:
 
         self._compare_results(logits, k, p)
 
+    @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA-only fast path")
+    @pytest.mark.parametrize("vocab_size", [32771, 160000])
+    @pytest.mark.parametrize("vocab_stride", [1, 2])
+    @pytest.mark.parametrize("with_topp", [False, True])
+    def test_parallel_gather_preserves_masked_logits_in_graph(
+        self, monkeypatch, vocab_size: int, vocab_stride: int, with_topp: bool
+    ):
+        """Preserve ties, grammar masks, and mixed rows across graph replays."""
+        from vllm.v1.sample.ops import topk_topp_triton as ops
+
+        source = torch.randn(6, vocab_size, generator=self.generator) * 4
+        # Force the sigma estimate to miss most top-k candidates.
+        source[0, 0] = 1000.0
+        source[1] = source[1].to(torch.bfloat16).float()
+        source[2, :-7] = -float("inf")
+        source[3] = -float("inf")
+        k = torch.tensor([20, 20, 20, 20, vocab_size, 1], dtype=torch.int32)
+        p = torch.full((6,), 0.95) if with_topp else None
+        with monkeypatch.context() as patch:
+            patch.setattr(ops, "_TOPK_PARALLEL_MAX_BATCH", 0)
+            expected = ops.apply_top_k_top_p_triton(source.clone(), k, p)
+
+        backing = torch.full((6, vocab_size * vocab_stride + 3), 123.0)
+        work = backing[:, 1:-2:vocab_stride]
+        for _ in range(3):
+            work.copy_(source)
+            output = ops.apply_top_k_top_p_triton(work, k, p)
+        torch.accelerator.synchronize()
+        assert torch.equal(output, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            work.copy_(source)
+            output = ops.apply_top_k_top_p_triton(work, k, p)
+        for _ in range(3):
+            graph.replay()
+            assert torch.equal(output, expected)
+        assert torch.all(backing[:, 0] == 123)
+        assert torch.all(backing[:, -2:] == 123)
+
     def test_both_disabled(self):
         """Test when both k and p are None (should be no-op)."""
         from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton

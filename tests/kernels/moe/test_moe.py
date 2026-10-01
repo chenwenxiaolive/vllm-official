@@ -170,7 +170,7 @@ NUM_EXPERTS = [8, 64, 192]
 NUM_EXPERTS_LARGE = [128, 256]
 EP_SIZE = [1, 4]
 TOP_KS = [2, 6]
-TOP_KS_SMALL = [1, 2]
+TOP_KS_SMALL = [1, 2, 8]
 
 MOE_MARLIN_QUANT_TEST_CONFIGS = [
     # AWQ-INT4
@@ -249,6 +249,8 @@ FUSED_MOE_MNK_FACTORS_SMALL_M = [
     (1, 2048, 128),
     (2, 2048, 128),
     (2, 2048, 511),
+    (6, 192, 3072),
+    (9, 192, 3072),
 ]
 
 FUSED_MOE_WN16_MNK_FACTORS = [
@@ -545,6 +547,120 @@ def test_fused_moe_int64_overflow(workspace_init):
             topk=topk,
             global_num_experts=e,
         )
+
+
+@pytest.mark.parametrize("num_items", [1, 48, 64])
+@pytest.mark.parametrize("ignore_invalid", [False, True])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA graph test")
+def test_small_batch_assignment_preserves_routes(
+    num_items: int, ignore_invalid: bool, offset: int
+) -> None:
+    """Retain each routed row exactly once across padding and graph replays."""
+    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+        moe_align_small_batch,
+    )
+
+    storage = torch.zeros(num_items + offset, device="cuda", dtype=torch.int32)
+    ids = storage[offset:]
+    moe_align_small_batch(ids, 8, 256, ignore_invalid)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        sorted_ids, experts, padded = moe_align_small_batch(ids, 8, 256, ignore_invalid)
+    for shift in range(3):
+        values = (torch.arange(num_items, device="cuda", dtype=torch.int32) + shift) % 3
+        values[::7] = -1
+        values[1::13] = 256
+        ids.copy_(values)
+        graph.replay()
+        original = ids.cpu().tolist()
+        expected: dict[int, list[int]] = {}
+        for token, expert in enumerate(original):
+            if not 0 <= expert < 256:
+                if ignore_invalid:
+                    continue
+                expert = -1
+            expected.setdefault(expert, []).append(token)
+        count = padded.item()
+        assert count == sum((len(v) + 7) // 8 * 8 for v in expected.values())
+        actual: dict[int, list[int]] = {}
+        blocks = sorted_ids[:count].cpu().view(-1, 8).tolist()
+        for expert, tokens in zip(experts[: count // 8].cpu().tolist(), blocks):
+            assert all(0 <= token <= num_items for token in tokens)
+            actual.setdefault(expert, []).extend(t for t in tokens if t != num_items)
+        assert actual == expected
+
+
+@pytest.mark.parametrize("m", [1, 6])
+@pytest.mark.parametrize("shared_experts", [False, True])
+@pytest.mark.parametrize("offset", [0, 1])
+@pytest.mark.parametrize("disable_fusion", [False, True])
+def test_fused_moe_silu_preserves_bf16_rounding(
+    m: int,
+    shared_experts: bool,
+    offset: int,
+    disable_fusion: bool,
+    monkeypatch,
+    workspace_init,
+):
+    """Both MoE APIs retain BF16 results through the small-batch fast paths."""
+    from vllm.model_executor.layers.fused_moe.experts import triton_moe
+
+    if not current_platform.is_cuda() or current_platform.get_device_name() != (
+        "NVIDIA H200"
+    ):
+        pytest.skip("Specialized BF16 fusion is enabled only on H200")
+    set_random_seed(9297)
+    a = torch.randn(m * 3072 + offset, device="cuda", dtype=torch.bfloat16)
+    a = a[offset:].view(m, 3072)
+    w1 = torch.randn(256 * 384 * 3072 + offset, device="cuda", dtype=torch.bfloat16)
+    w1.mul_(0.02)
+    w1 = w1[offset:].view(256, 384, 3072)
+    w2 = torch.randn((256, 3072, 192), device="cuda", dtype=torch.bfloat16) * 0.02
+    scores = torch.randn((m, 256), device="cuda")
+    weights, ids = scores.softmax(-1).topk(8, dim=-1)
+    if shared_experts:
+        ids[:] = torch.arange(8, device="cuda")
+    ids = ids.int()
+    weights /= weights.sum(-1, keepdim=True)
+    config = fused_moe_module.try_get_optimal_moe_config(w1.shape, w2.shape, 8, None, m)
+    cache = torch.empty((m * 8, 192), device="cuda", dtype=torch.bfloat16)
+    assert fused_moe_module._use_fused_moe_gemm_silu(a, w1, cache, 8, config)
+    modular = modular_triton_fused_moe(
+        make_dummy_moe_config(), FUSED_MOE_UNQUANTIZED_CONFIG
+    )
+
+    def run_modular():
+        return modular.apply(
+            a,
+            w1,
+            w2,
+            weights,
+            ids,
+            activation=MoEActivation.SILU,
+            global_num_experts=256,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+    with set_current_vllm_config(vllm_config):
+        with monkeypatch.context() as patch:
+            for module in (fused_moe_module, triton_moe):
+                if disable_fusion:
+                    patch.setattr(
+                        module, "_use_fused_moe_gemm_silu", lambda *args: False
+                    )
+                patch.setattr(
+                    module, "_get_fused_moe_down_config", lambda config, *args: config
+                )
+            expected_functional = fused_moe_module.fused_experts_impl(
+                a, w1, w2, weights, ids
+            )
+            expected_modular = run_modular().clone()
+        actual_functional = fused_moe_module.fused_experts_impl(a, w1, w2, weights, ids)
+        actual_modular = run_modular()
+    assert torch.equal(actual_functional, expected_functional)
+    assert torch.equal(actual_modular, expected_modular)
 
 
 @pytest.mark.parametrize("m,n,k", FUSED_MOE_MNK_FACTORS_SMALL_M)

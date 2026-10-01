@@ -75,11 +75,25 @@ Select `mtp_recursive` and supply the draft checkpoint:
 ```bash
 vllm serve /path/to/iquest-q1 \
     --tensor-parallel-size 8 \
-    --speculative-config '{"method":"mtp_recursive","model":"/path/to/draft","num_speculative_tokens":7}'
+    --speculative-config '{"method":"mtp_recursive","model":"/path/to/draft","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
 ```
 
 The native `method="mtp"` path is not supported for IQuestQ1. Embedded
 `mtp_layers.*` weights in target checkpoints are ignored.
+
+On H200, the built-in unquantized MoE configuration for 256 experts and
+192 intermediate channels per rank tunes the six-token verification batch
+used by a single request at depth five. Other batch sizes retain the generic
+launch parameters. This kernel configuration follows the usual device and
+shape lookup and also applies to other models with the same lookup key.
+
+For latency-focused H200 serving at depth five, add
+`--compilation-config '{"compile_sizes":[1,6]}'` to specialize the one-token
+draft and six-token verification batches. This setting adds static compiled
+partitions; other token counts retain dynamic compilation. It targets
+single-request decoding and increases compilation work at startup. Static
+compilation can select different floating-point kernels, so validate model
+scores as well as latency for the intended workload.
 
 The EAGLE proposer runs one physical draft layer repeatedly. Each step consumes
 the previous step's token and normalized hidden state and appends its own KV.

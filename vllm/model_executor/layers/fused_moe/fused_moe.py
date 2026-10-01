@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
+    moe_align_small_batch,
 )
 from vllm.model_executor.layers.fused_moe.utils import (
     enable_swap_ab,
@@ -31,8 +32,11 @@ from vllm.model_executor.layers.fused_moe.utils import (
     resolve_moe_use_td,
     warn_if_moe_use_td_ineffective,
 )
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    silu_mul_per_token_quant_fp8,
+)
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.triton_utils.allocation import set_triton_allocator
 from vllm.utils.math_utils import next_power_of_2
 from vllm.utils.platform_utils import get_device_name_as_file_name
@@ -400,10 +404,10 @@ def fused_moe_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     offs = tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
-    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
-    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
-        return
     if not naive_block_assignment:
+        num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+        if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+            return
         offs_token_id = pid_m * BLOCK_SIZE_M + offs
         offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     else:
@@ -758,6 +762,193 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
 
+@triton.jit
+def _fused_moe_gemm_silu_kernel(
+    A,
+    W,
+    C,
+    SORTED,
+    EXPERTS,
+    PADDED,
+    ROUTES: tl.constexpr,
+    EM: tl.constexpr,
+    K: tl.constexpr,
+    D: tl.constexpr,
+    TOPK: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_we: tl.constexpr,
+    stride_wn: tl.constexpr,
+    stride_wk: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    BM: tl.constexpr,
+    BN: tl.constexpr,
+    BK: tl.constexpr,
+    GM: tl.constexpr,
+    NAIVE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nm = tl.cdiv(EM, BM)
+    nn = tl.cdiv(D, BN)
+    group = pid // (GM * nn)
+    first = group * GM
+    group_size = tl.minimum(nm - first, GM)
+    pm = first + (pid % (GM * nn)) % group_size
+    pn = (pid % (GM * nn)) // group_size
+    rows = tl.arange(0, BM)
+    if NAIVE:
+        route = tl.where(rows == 0, pm, ROUTES)
+    else:
+        padded = tl.load(PADDED)
+        if pm * BM >= padded:
+            return
+        route = tl.load(SORTED + pm * BM + rows)
+    route = route.to(tl.int64)
+    valid = route < ROUTES
+    expert = tl.load(EXPERTS + pm).to(tl.int64)
+    n = pn * BN + tl.arange(0, BN)
+    cp = C + route[:, None] * stride_cm + n[None, :] * stride_cn
+    mask = valid[:, None] & (n[None, :] < D)
+    if expert < 0:
+        tl.store(cp, 0.0, mask)
+        return
+    kk = tl.arange(0, BK)
+    ap = A + (route[:, None] // TOPK) * stride_am + kk[None, :] * stride_ak
+    wp = W + expert * stride_we + kk[:, None] * stride_wk + (n[None, :] % D) * stride_wn
+    gate = tl.full((BM, BN), 0, tl.float32)
+    up = tl.full((BM, BN), 0, tl.float32)
+    for block in range(tl.cdiv(K, BK)):
+        x = tl.load(ap, valid[:, None] & (kk[None, :] < K - block * BK), 0.0)
+        wg = tl.load(wp, kk[:, None] < K - block * BK, 0.0)
+        wu = tl.load(wp + D * stride_wn, kk[:, None] < K - block * BK, 0.0)
+        gate += tl.dot(x, wg)
+        up += tl.dot(x, wu)
+        ap += BK * stride_ak
+        wp += BK * stride_wk
+    # Preserve GEMM output and packed SiLU BF16 rounding before multiplication.
+    gate = gate.to(tl.bfloat16).to(tl.float32)
+    up = up.to(tl.bfloat16).to(tl.float32)
+    activated = tl.div_rn(gate, 1.0 + tldevice.exp(-gate))
+    activated = activated.to(tl.bfloat16).to(tl.float32)
+    output = (activated * up).to(tl.bfloat16)
+    tl.store(cp, output, mask)
+
+
+def _use_fused_moe_gemm_silu(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    top_k: int,
+    config: dict[str, Any],
+) -> bool:
+    """Select the measured BF16 small-batch H200 kernel configuration."""
+    m = a.shape[0]
+    return (
+        m in (1, 6)
+        and a.is_cuda
+        and current_platform.is_cuda()
+        and a.dtype == w.dtype == out.dtype == torch.bfloat16
+        and a.shape[1] == 3072
+        and w.shape == (256, 384, 3072)
+        and out.shape == (m * 8, 192)
+        and top_k == 8
+        and config.get("BLOCK_SIZE_M") == (16 if m == 1 else 8)
+        and config.get("BLOCK_SIZE_N") == (64 if m == 1 else 32)
+        and config.get("BLOCK_SIZE_K") == 128
+        and config.get("GROUP_SIZE_M") == 1
+        and config.get("num_warps") == 4
+        and config.get("num_stages") == (4 if m == 1 else 3)
+        and config.get("SPLIT_K", 1) == 1
+        and current_platform.get_device_name() == "NVIDIA H200"
+    )
+
+
+def _get_fused_moe_down_config(
+    config: dict[str, Any],
+    num_tokens: int,
+    fused_silu: bool,
+    has_bias: bool,
+) -> dict[str, Any]:
+    """Avoid K padding for the measured 192-wide BF16 down projection."""
+    if (
+        fused_silu
+        and num_tokens in (1, 6)
+        and not has_bias
+        and not resolve_moe_use_td()
+    ):
+        return {
+            **config,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "num_stages": 3 if num_tokens == 1 else 4,
+        }
+    return config
+
+
+def invoke_fused_moe_gemm_silu(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    out: torch.Tensor,
+    sorted_token_ids: torch.Tensor | None,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
+    top_k: int,
+    config: dict[str, Any],
+) -> None:
+    """Write SiLU(gate) * up without materializing the gate/up GEMM output."""
+    block_m = config["BLOCK_SIZE_M"]
+    block_n = 32 if a.shape[0] == 1 else 16
+    routes = a.shape[0] * top_k
+    em = sorted_token_ids.numel() if sorted_token_ids is not None else routes * block_m
+    _fused_moe_gemm_silu_kernel[
+        (triton.cdiv(em, block_m) * triton.cdiv(out.shape[-1], block_n),)
+    ](
+        a,
+        w,
+        out,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        routes,
+        em,
+        a.shape[1],
+        out.shape[-1],
+        top_k,
+        *a.stride(),
+        *w.stride(),
+        *out.stride(),
+        block_m,
+        block_n,
+        config["BLOCK_SIZE_K"],
+        config["GROUP_SIZE_M"],
+        sorted_token_ids is None,
+        num_warps=config["num_warps"],
+        num_stages=4,
+    )
+
+
+def _get_fp8_moe_down_config(
+    a: torch.Tensor, b: torch.Tensor, config: dict[str, Any]
+) -> dict[str, Any]:
+    """Avoid padding the 192-wide FP8 reduction for six-token verification."""
+    if (
+        a.shape == (48, 192)
+        and b.shape == (256, 3072, 192)
+        and config.get("BLOCK_SIZE_M") == 16
+        and config.get("BLOCK_SIZE_N") == 64
+        and config.get("BLOCK_SIZE_K") == 128
+        and config.get("GROUP_SIZE_M") == 1
+        and config.get("SPLIT_K", 1) == 1
+        and config.get("num_warps") == 4
+        and config.get("num_stages") == 4
+        and current_platform.is_cuda()
+        and current_platform.get_device_name() == "NVIDIA H200"
+    ):
+        return {**config, "BLOCK_SIZE_K": 64, "num_stages": 3}
+    return config
+
+
 def invoke_fused_moe_triton_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -767,7 +958,7 @@ def invoke_fused_moe_triton_kernel(
     topk_weights: torch.Tensor | None,
     sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
     mul_routed_weight: bool,
     top_k: int,
     config: dict[str, Any],
@@ -783,6 +974,9 @@ def invoke_fused_moe_triton_kernel(
     assert topk_weights is not None or not mul_routed_weight
     assert topk_weights is None or topk_weights.stride(1) == 1
     assert sorted_token_ids is None or sorted_token_ids.stride(0) == 1
+
+    if use_fp8_w8a8 and per_channel_quant and block_shape is None:
+        config = _get_fp8_moe_down_config(A, B, config)
 
     if use_fp8_w8a8:
         SWAP_AB = enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
@@ -820,6 +1014,7 @@ def invoke_fused_moe_triton_kernel(
     M = A.size(0)
     num_tokens = M * top_k
     if sorted_token_ids is not None:
+        assert num_tokens_post_padded is not None
         EM = sorted_token_ids.size(0)
         if A.size(0) < config["BLOCK_SIZE_M"]:
             # optimize for small batch_size.
@@ -918,7 +1113,7 @@ def dispatch_fused_moe_kernel(
     topk_weights: torch.Tensor | None,
     sorted_token_ids: torch.Tensor | None,
     expert_ids: torch.Tensor,
-    num_tokens_post_padded: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor | None,
     mul_routed_weight: bool,
     top_k: int,
     config: dict[str, Any],
@@ -942,6 +1137,7 @@ def dispatch_fused_moe_kernel(
         block_shape is not None and block_shape[1] > 0
     ):
         assert B_bias is None
+        assert num_tokens_post_padded is not None
 
         use_moe_wna16_cuda = should_moe_wna16_use_cuda(
             num_valid_tokens=num_tokens,
@@ -1550,8 +1746,27 @@ def _prepare_expert_assignment(
     use_int4_w4a16: bool = False,
     block_shape: list[int] | None = None,
     ignore_invalid_experts: bool = False,
-) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    use_small_batch_grouping: bool = False,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
     """Prepare expert assignments for the aligned and low-latency Triton paths."""
+    if (
+        use_small_batch_grouping
+        and num_tokens == 6
+        and top_k_num == 8
+        and global_num_experts == 256
+        and expert_map is None
+        and config["BLOCK_SIZE_M"] in (8, 16)
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and current_platform.is_cuda()
+        and "H200"
+        in get_device_name_as_file_name(topk_ids.device.index or 0).split("_")
+        and not (use_int8_w8a16 or use_int4_w4a16)
+        and block_shape is None
+    ):
+        return moe_align_small_batch(
+            topk_ids, config["BLOCK_SIZE_M"], global_num_experts, ignore_invalid_experts
+        )
     # SPARSITY_FACTOR is a heuristic margin ensuring tokens_in_chunk * top_k
     # activates only a small fraction of total experts
     # Skips moe_align_block_size and activates the `sorted_token_ids is None`
@@ -1567,15 +1782,11 @@ def _prepare_expert_assignment(
     )
 
     if naive_block_assignment:
+        # One block per routed token; the launch grid already bounds every block.
         return (
             None,
             topk_ids.view(-1),
-            torch.full(
-                (1,),
-                topk_ids.numel() * config["BLOCK_SIZE_M"],
-                dtype=torch.int32,
-                device=topk_ids.device,
-            ),
+            None,
         )
 
     return moe_align_block_size(
@@ -1782,43 +1993,89 @@ def fused_experts_impl(
         use_int4_w4a16=use_int4_w4a16,
         block_shape=block_shape,
         ignore_invalid_experts=True,
+        use_small_batch_grouping=(
+            w1.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+            and w1.shape[1:] == (384, 3072)
+        ),
     )
 
-    dispatch_fused_moe_kernel(
-        qhidden_states,
-        w1,
-        intermediate_cache1,
-        a1q_scale,
-        w1_scale,
-        w1_zp,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        apply_router_weight_on_input,
-        top_k_num,
-        config,
-        compute_type=compute_type,
-        use_fp8_w8a8=use_fp8_w8a8,
-        use_int8_w8a8=use_int8_w8a8,
-        use_int8_w8a16=use_int8_w8a16,
-        use_int4_w4a16=use_int4_w4a16,
-        per_channel_quant=per_channel_quant,
-        block_shape=block_shape,
-        B_bias=w1_bias,
+    fused_silu = (
+        activation_enum == MoEActivation.SILU
+        and expert_map is None
+        and global_num_experts == w1.shape[0]
+        and not apply_router_weight_on_input
+        and quant_dtype is None
+        and not (use_fp8_w8a8 or use_int8_w8a8 or use_int8_w8a16 or use_int4_w4a16)
+        and block_shape is None
+        and a1q_scale is None
+        and w1_scale is None
+        and w1_bias is None
+        and _use_fused_moe_gemm_silu(
+            qhidden_states, w1, intermediate_cache2, top_k_num, config
+        )
     )
+    fused_silu_quant = (
+        activation_enum == MoEActivation.SILU
+        and use_fp8_w8a8
+        and per_channel_quant
+        and block_shape is None
+        and a2_scale is None
+        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and current_platform.is_cuda()
+    )
+    if fused_silu:
+        invoke_fused_moe_gemm_silu(
+            qhidden_states,
+            w1,
+            intermediate_cache2,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            top_k_num,
+            config,
+        )
+    else:
+        dispatch_fused_moe_kernel(
+            qhidden_states,
+            w1,
+            intermediate_cache1,
+            a1q_scale,
+            w1_scale,
+            w1_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            apply_router_weight_on_input,
+            top_k_num,
+            config,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            use_int4_w4a16=use_int4_w4a16,
+            per_channel_quant=per_channel_quant,
+            block_shape=block_shape,
+            B_bias=w1_bias,
+        )
 
-    apply_moe_activation(
-        activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
-    )
+        if not fused_silu_quant:
+            apply_moe_activation(
+                activation_enum, intermediate_cache2, intermediate_cache1.view(-1, N)
+            )
 
-    qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
-        A=intermediate_cache2,
-        A_scale=a2_scale,
-        quant_dtype=quant_dtype,
-        per_act_token_quant=per_channel_quant,
-        block_shape=block_shape,
-    )
+    if fused_silu_quant:
+        qintermediate_cache2, a2q_scale = silu_mul_per_token_quant_fp8(
+            intermediate_cache1.view(-1, N)
+        )
+    else:
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            A=intermediate_cache2,
+            A_scale=a2_scale,
+            quant_dtype=quant_dtype,
+            per_act_token_quant=per_channel_quant,
+            block_shape=block_shape,
+        )
 
     if expert_map is not None:
         intermediate_cache3.zero_()
@@ -1836,7 +2093,9 @@ def fused_experts_impl(
         num_tokens_post_padded,
         not apply_router_weight_on_input,
         1,
-        config,
+        _get_fused_moe_down_config(
+            config, hidden_states.shape[0], fused_silu, w2_bias is not None
+        ),
         compute_type=compute_type,
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,

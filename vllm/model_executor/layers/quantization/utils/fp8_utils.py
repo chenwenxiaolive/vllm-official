@@ -28,7 +28,7 @@ from vllm.model_executor.parameter import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 from vllm.utils.deep_gemm import (
     get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
@@ -77,6 +77,64 @@ def input_to_float8(
     scale = finfo.max / amax
     x_scl_sat = (x * scale).clamp(min=finfo.min, max=finfo.max)
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
+
+
+@triton.jit
+def _silu_mul_per_token_quant_fp8(
+    input_ptr,
+    output_ptr,
+    scale_ptr,
+    row_stride: tl.constexpr,
+    hidden_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    gate = tl.load(input_ptr + row * row_stride + cols, cols < hidden_size, 0).to(
+        tl.float32
+    )
+    up = tl.load(
+        input_ptr + row * row_stride + hidden_size + cols,
+        cols < hidden_size,
+        0,
+    ).to(tl.float32)
+    activated = tl.div_rn(gate, 1.0 + tldevice.exp(-gate))
+    # Preserve both roundings of the unfused CUDA activation.
+    activated = activated.to(input_ptr.dtype.element_ty).to(tl.float32)
+    output = (activated * up).to(input_ptr.dtype.element_ty).to(tl.float32)
+    absmax = tl.max(tl.abs(output), axis=0)
+    # Multiplication by 1/448 can move a scale across an FP8 rounding boundary.
+    scale = tl.maximum(tl.div_rn(absmax, 448.0), 1.0 / (448.0 * 512.0))
+    quantized = tl.clamp(tl.div_rn(output, scale), -448.0, 448.0)
+    tl.store(output_ptr + row * hidden_size + cols, quantized, cols < hidden_size)
+    tl.store(scale_ptr + row, scale)
+
+
+def silu_mul_per_token_quant_fp8(
+    input: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse rounded SiLU-and-multiply with dynamic per-token E4M3 quantization."""
+    assert input.ndim == 2 and input.shape[1] % 2 == 0
+    assert input.stride(1) == 1
+    assert input.dtype in (torch.bfloat16, torch.float16)
+    num_tokens, width = input.shape
+    hidden_size = width // 2
+    output = torch.empty(
+        (num_tokens, hidden_size), device=input.device, dtype=torch.float8_e4m3fn
+    )
+    scales = torch.empty((num_tokens, 1), device=input.device, dtype=torch.float32)
+    if num_tokens:
+        _silu_mul_per_token_quant_fp8[(num_tokens,)](
+            input,
+            output,
+            scales,
+            input.stride(0),
+            hidden_size,
+            triton.next_power_of_2(hidden_size),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return output, scales
 
 
 @triton.jit
