@@ -19,7 +19,10 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _get_fused_moe_down_config,
     _prepare_expert_assignment,
+    _use_fused_moe_gemm_silu,
+    invoke_fused_moe_gemm_silu,
     invoke_fused_moe_triton_kernel,
     invoke_fused_moe_wna16_triton_kernel,
     try_get_optimal_moe_config,
@@ -37,6 +40,7 @@ from vllm.model_executor.layers.fused_moe.utils import (
 )
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     is_deep_gemm_e8m0_used,
+    silu_mul_per_token_quant_fp8,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     FP8_DTYPE,
@@ -350,6 +354,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 use_int8_w8a16=self.quant_config.use_int8_w8a16,
                 use_int4_w4a16=self.quant_config.use_int4_w4a16,
                 block_shape=self.block_shape,
+                use_small_batch_grouping=(
+                    w1.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                    and w1.shape[1:] == (384, 3072)
+                ),
             )
         )
 
@@ -392,7 +400,40 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             else (a1q_scale if a1q_scale is not None else self.a1_scale)
         )
 
+        fused_silu = (
+            activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and expert_map is None
+            and global_num_experts == w1.shape[0]
+            and not apply_router_weight_on_input
+            and self.quant_dtype is None
+            and self.block_shape is None
+            and not self.quantization_emulation
+            and lora_context is None
+            and input_scale is None
+            and a2_scale is None
+            and self.w1_scale is None
+            and self.w2_scale is None
+            and self.w1_bias is None
+            and self.w2_bias is None
+            and _use_fused_moe_gemm_silu(
+                hidden_states, w1, intermediate_cache2, top_k_num, config
+            )
+        )
+
         def _base_w13_fn():
+            if fused_silu:
+                invoke_fused_moe_gemm_silu(
+                    hidden_states,
+                    w1,
+                    intermediate_cache2,
+                    sorted_token_ids,
+                    expert_ids,
+                    num_tokens_post_padded,
+                    top_k_num,
+                    config,
+                )
+                return
             invoke_fused_moe_triton_kernel(
                 hidden_states,
                 w1,
@@ -476,12 +517,28 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
         a2q_scale: torch.Tensor | None = None
 
+        # Fuse dynamic per-token quantization while preserving activation rounding.
+        if (
+            activation == MoEActivation.SILU
+            and self.activation_config.clamp_limit is None
+            and self.quant_config.use_fp8_w8a8
+            and self.per_act_token_quant
+            and self.block_shape is None
+            and a2_scale is None
+            and not self.quantization_emulation
+            and lora_context is None
+            and intermediate_cache1.dtype in (torch.bfloat16, torch.float16)
+            and current_platform.is_cuda()
+        ):
+            qintermediate_cache2, a2q_scale = silu_mul_per_token_quant_fp8(
+                intermediate_cache1.view(-1, N)
+            )
         # Fuse SiLU+Mul + FP8 block quantize into a single kernel
         # when conditions permit (gated SiLU, fp8 block quant with
         # group_size=128, no LoRA requiring the BF16 intermediate).
         # The fused kernel has no clamp parameter, so a configured
         # SwiGLU clamp limit falls through to the unfused path.
-        if (
+        elif (
             activation == MoEActivation.SILU
             and self.activation_config.clamp_limit is None
             and self.quant_config.use_fp8_w8a8
@@ -495,9 +552,10 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quant_dtype=current_platform.fp8_dtype(),
             )
         else:
-            self.activation(
-                activation, intermediate_cache2, intermediate_cache1.view(-1, N)
-            )
+            if not fused_silu:
+                self.activation(
+                    activation, intermediate_cache2, intermediate_cache1.view(-1, N)
+                )
 
             qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
                 intermediate_cache2,
@@ -526,7 +584,9 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 num_tokens_post_padded,
                 not apply_router_weight_on_input,
                 1,
-                config,
+                _get_fused_moe_down_config(
+                    config, hidden_states.shape[0], fused_silu, self.w2_bias is not None
+                ),
                 compute_type=compute_type,
                 use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
                 use_int8_w8a8=self.quant_config.use_int8_w8a8,

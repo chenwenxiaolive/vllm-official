@@ -22,6 +22,107 @@ except ImportError:
     pytest.skip("vllm_flash_attn is unavailable", allow_module_level=True)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(90), reason="Hopper FP8 decode"
+)
+@pytest.mark.parametrize("num_tokens", [1, 6, 8])
+@pytest.mark.parametrize("seq_len", [17, 4097])
+@pytest.mark.parametrize("window", [None, 17, 4096])
+@pytest.mark.parametrize("q_scale", [1.0, 0.3])
+@torch.inference_mode()
+def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale):
+    """FP8 decode preserves causal/SWA masks, cache scales and learned sinks."""
+    from types import SimpleNamespace
+
+    from vllm.models.iquest_q1.attention import IQuestFlashAttentionImpl
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+
+    set_random_seed(93010)
+    device = "cuda"
+    page_size, heads, dim = 16, 6, 128
+    pages = (seq_len + page_size - 1) // page_size
+    query = torch.randn(
+        num_tokens + 2, heads + 1, dim, device=device, dtype=torch.bfloat16
+    )[1:, :heads]
+    cache = (
+        torch.randn(pages, 1, page_size, 2 * dim, device=device, dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    table = torch.randperm(pages, device=device).int().view(1, -1)
+    lengths = torch.tensor([seq_len], device=device, dtype=torch.int32)
+    query_start = torch.tensor([0, num_tokens], device=device, dtype=torch.int32)
+    layer = SimpleNamespace(
+        sink_key=4 * torch.randn(1, dim, device=device, dtype=torch.bfloat16),
+        _q_scale=torch.tensor([q_scale], device=device),
+        _k_scale=torch.tensor([0.7], device=device),
+        _v_scale=torch.tensor([1.3], device=device),
+    )
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=num_tokens,
+        max_query_len=num_tokens,
+        query_start_loc=query_start,
+        max_seq_len=seq_len,
+        seq_lens=lengths,
+        block_table=table,
+        slot_mapping=torch.empty(0, device=device, dtype=torch.int64),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    impl = IQuestFlashAttentionImpl(heads, dim, dim**-0.5, 1, None, window, "fp8_e4m3")
+    impl.vllm_flash_attn_version = 3
+    output = torch.full(
+        (num_tokens + 2, heads + 1, dim), -73, device=device, dtype=torch.bfloat16
+    )[1:, :heads]
+
+    def run():
+        impl.forward(layer, query, None, None, cache, metadata, output)
+
+    def dense(active_tokens, active_seq_len):
+        packed = cache.view(torch.float8_e4m3fn).float()[table[0].long()]
+        key, value = packed.reshape(-1, 2 * dim)[:active_seq_len].chunk(2, -1)
+        key = key * layer._k_scale
+        value = value * layer._v_scale
+        q = query[:active_tokens].float()
+        qdq = (q / layer._q_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+        qdq = qdq.float() * layer._q_scale
+        scores = torch.einsum("mhd,nd->mhn", qdq, key) * dim**-0.5
+        query_positions = torch.arange(
+            active_seq_len - active_tokens, active_seq_len, device=device
+        )
+        key_positions = torch.arange(active_seq_len, device=device)
+        visible = key_positions[None, :] <= query_positions[:, None]
+        if window is not None:
+            visible &= key_positions[None, :] > query_positions[:, None] - window
+        scores.masked_fill_(~visible[:, None, :], -torch.inf)
+        sink = torch.einsum("mhd,kd->mh", q, layer.sink_key.float()) * dim**-0.5
+        probabilities = torch.cat([scores, sink[:, :, None]], -1).softmax(-1)
+        return torch.einsum("mhn,nd->mhd", probabilities[:, :, :-1], value)
+
+    run()
+    torch.testing.assert_close(
+        output[:num_tokens].float(), dense(num_tokens, seq_len), atol=1e-2, rtol=1e-2
+    )
+    assert torch.all(output[num_tokens:] == -73)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.testing.assert_close(
+        output[:num_tokens].float(), dense(num_tokens, seq_len), atol=1e-2, rtol=1e-2
+    )
+    # Replay uses new device lengths without recapturing the padded query shape.
+    query_start[1] = 1
+    lengths[0] = seq_len - 1
+    graph.replay()
+    torch.testing.assert_close(
+        output[:1].float(), dense(1, seq_len - 1), atol=1e-2, rtol=1e-2
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [0, 1, 17, 1024])
 @pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("strided", [False, True])
@@ -62,7 +163,11 @@ def test_sink_preserves_fp32_eager_rounding(num_tokens, output_dtype, strided):
 @pytest.mark.parametrize("head_size", [72, 128])
 @pytest.mark.parametrize("sliding_window", [None, 17])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("query_lens", [[1, 3, 19], [1, 1, 1]])
+@pytest.mark.parametrize("query_lens", [[1, 6, 19], [1, 1, 1]])
+@pytest.mark.parametrize(
+    "kv_cache_dtype,per_head_scales",
+    [("auto", False), ("fp8", False), ("fp8_e4m3", True)],
+)
 @torch.inference_mode()
 def test_iquest_paged_learned_sink_matches_dense_attention(
     fa_version: int,
@@ -71,10 +176,24 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
     sliding_window: int | None,
     dtype: torch.dtype,
     query_lens: list[int],
+    kv_cache_dtype: str,
+    per_head_scales: bool,
 ) -> None:
     """A learned key remains visible outside SWA and respects KV-head sharing."""
     if not is_fa_version_supported(fa_version):
         pytest.skip(f"FlashAttention {fa_version} is unavailable")
+    quantized = kv_cache_dtype.startswith("fp8")
+    if quantized and (
+        dtype != torch.bfloat16
+        or head_size % 16 != 0
+        or not (
+            fa_version == 3
+            and current_platform.is_device_capability_family(90)
+            or fa_version == 4
+            and current_platform.is_device_capability_family(100)
+        )
+    ):
+        pytest.skip("FP8 requires supported FA/device, BF16 output and aligned heads")
     if (
         fa_version == 4
         and current_platform.is_device_capability(90)
@@ -120,10 +239,57 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         suffix_kv_lens=None,
     )
     impl = IQuestFlashAttentionImpl(
-        num_q_heads, head_size, scale, num_kv_heads, None, sliding_window, "auto"
+        num_q_heads,
+        head_size,
+        scale,
+        num_kv_heads,
+        None,
+        sliding_window,
+        kv_cache_dtype,
     )
     impl.vllm_flash_attn_version = fa_version
     impl.fa4_hd256 = False
+    layer = SimpleNamespace(sink_key=sink_key)
+    reference_query = query[:num_tokens].float()
+    reference_cache = kv_cache.float()
+    if quantized:
+        scale_heads = num_kv_heads if per_head_scales else 1
+        layer._q_scale = torch.linspace(0.25, 0.5, scale_heads, device=device)
+        layer._k_scale = torch.linspace(0.125, 0.25, scale_heads, device=device)
+        layer._v_scale = torch.linspace(0.5, 1.0, scale_heads, device=device)
+        keys, values = (
+            kv_cache.transpose(1, 2)
+            .reshape(-1, num_kv_heads, 2 * head_size)
+            .chunk(2, dim=-1)
+        )
+        kv_cache = torch.empty_like(kv_cache, dtype=torch.uint8)
+        slots = torch.arange(keys.shape[0], device=device, dtype=torch.int64)
+        impl.do_kv_cache_update(
+            layer, keys.contiguous(), values.contiguous(), kv_cache, slots
+        )
+        fp8_dtype = current_platform.fp8_dtype()
+        fp8_max = torch.finfo(fp8_dtype).max
+        k_scale = layer._k_scale.view(1, -1, 1, 1)
+        v_scale = layer._v_scale.view(1, -1, 1, 1)
+        k, v = reference_cache.chunk(2, dim=-1)
+        packed_reference = torch.cat(
+            [
+                (k / k_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype),
+                (v / v_scale).clamp(-fp8_max, fp8_max).to(fp8_dtype),
+            ],
+            dim=-1,
+        )
+        torch.testing.assert_close(kv_cache, packed_reference.view(torch.uint8))
+        k, v = packed_reference.float().chunk(2, dim=-1)
+        reference_cache = torch.cat([k * k_scale, v * v_scale], dim=-1)
+        q_scale = (
+            layer._q_scale.expand(num_kv_heads)
+            .repeat_interleave(num_q_heads // num_kv_heads)
+            .view(1, num_q_heads, 1)
+        )
+        reference_query = (reference_query / q_scale).clamp(-fp8_max, fp8_max).to(
+            fp8_dtype
+        ).float() * q_scale
     output = torch.full(
         (num_tokens + 5, num_q_heads + 1, head_size),
         -73,
@@ -131,7 +297,7 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         device=device,
     )[:, :num_q_heads]
     impl.forward(
-        SimpleNamespace(sink_key=sink_key),
+        layer,
         query,
         None,
         None,
@@ -139,18 +305,46 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         metadata,
         output,
     )
+    if quantized:
+        eager_output = output.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            impl.forward(layer, query, None, None, kv_cache, metadata, output)
+        graph.replay()
+        torch.testing.assert_close(output, eager_output, rtol=0, atol=0)
+        from vllm.v1.attention.backends.flash_attn import flash_attn_varlen_func
+
+        k, v = packed_reference.transpose(1, 2).chunk(2, dim=-1)
+        normal_output, normal_lse = flash_attn_varlen_func(
+            q=(reference_query / q_scale).to(fp8_dtype),
+            k=k,
+            v=v,
+            cu_seqlens_q=query_start_loc,
+            seqused_k=metadata.seq_lens,
+            max_seqlen_q=max(query_lens),
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=scale,
+            causal=True,
+            window_size=(sliding_window - 1, 0) if sliding_window else (-1, -1),
+            block_table=block_table,
+            fa_version=fa_version,
+            q_descale=layer._q_scale.expand(len(kv_lens), num_kv_heads),
+            k_descale=layer._k_scale.expand(len(kv_lens), num_kv_heads),
+            v_descale=layer._v_scale.expand(len(kv_lens), num_kv_heads),
+            return_softmax_lse=True,
+        )
 
     repeat = num_q_heads // num_kv_heads
     sink = sink_key.float().repeat_interleave(repeat, dim=0)
     start = 0
     for seq, (query_len, kv_len) in enumerate(zip(query_lens, kv_lens)):
         cache = (
-            kv_cache[block_table[seq]]
+            reference_cache[block_table[seq]]
             .transpose(1, 2)
             .reshape(-1, num_kv_heads, 2 * head_size)[:kv_len]
         )
         key, value = cache.float().repeat_interleave(repeat, dim=1).chunk(2, dim=-1)
-        q = query[start : start + query_len].float()
+        q = reference_query[start : start + query_len]
         logits = torch.einsum("qhd,khd->hqk", q, key) * scale
         query_pos = torch.arange(kv_len - query_len, kv_len, device=device)
         key_pos = torch.arange(kv_len, device=device)
@@ -158,14 +352,36 @@ def test_iquest_paged_learned_sink_matches_dense_attention(
         if sliding_window is not None:
             visible &= key_pos[None, :] > query_pos[:, None] - sliding_window
         logits.masked_fill_(~visible[None, :, :], -torch.inf)
-        sink_logits = torch.einsum("qhd,hd->hq", q, sink) * scale
+        sink_logits = (
+            torch.einsum("qhd,hd->hq", query[start : start + query_len].float(), sink)
+            * scale
+        )
+        if quantized:
+            dense_lse = logits.logsumexp(-1)
+            torch.testing.assert_close(
+                normal_lse[:, start : start + query_len],
+                dense_lse,
+                atol=1e-3,
+                rtol=1e-3,
+            )
+            corrected = normal_output[start : start + query_len].float() * (
+                dense_lse - sink_logits
+            ).sigmoid().T.unsqueeze(-1)
+            torch.testing.assert_close(
+                output[start : start + query_len].float(),
+                corrected,
+                atol=1e-2,
+                rtol=1e-2,
+            )
         probabilities = torch.cat([logits, sink_logits[..., None]], dim=-1).softmax(-1)
         expected = torch.einsum("hqk,khd->qhd", probabilities[..., :-1], value)
+        # FP8 FlashAttention also rounds its internal attention probabilities.
+        tolerance = 5e-2 if quantized else (1e-2 if dtype == torch.bfloat16 else 1e-3)
         torch.testing.assert_close(
             output[start : start + query_len].float(),
             expected,
-            atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
-            rtol=1e-2 if dtype == torch.bfloat16 else 1e-3,
+            atol=tolerance,
+            rtol=tolerance,
         )
         start += query_len
     assert torch.all(output[num_tokens:] == -73)

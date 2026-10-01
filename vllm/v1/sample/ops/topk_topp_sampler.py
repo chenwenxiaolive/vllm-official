@@ -14,6 +14,8 @@ from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import (
+        _topk_compact_tiles,
+        _topk_gather_tiles,
         _topk_topp,
         _topp_split_mask,
         _topp_split_stats,
@@ -28,6 +30,9 @@ def register_top_k_top_p_warmups() -> None:
     """Register every native accelerator sampling kernel used at runtime."""
     if HAS_TRITON and not current_platform.is_cpu():
         _topk_topp.register_warmup()
+        if current_platform.is_cuda():
+            _topk_gather_tiles.register_warmup()
+            _topk_compact_tiles.register_warmup()
         if current_platform.is_cuda_alike():
             _topp_split_stats.register_warmup()
             _topp_split_step.register_warmup()
