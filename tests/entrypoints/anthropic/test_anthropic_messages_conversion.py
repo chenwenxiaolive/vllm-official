@@ -19,7 +19,7 @@ from typing import Annotated
 from unittest.mock import MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field, ValidationError
@@ -48,10 +48,240 @@ from vllm.entrypoints.serve.engine.protocol import PromptTokenUsageInfo, UsageIn
 from vllm.entrypoints.serve.exception_handling.handlers.validation import (
     validation_exception_handler,
 )
+from vllm.entrypoints.serve.middleware.authenticate import AuthenticationMiddleware
+from vllm.entrypoints.serve.middleware.ignore_images import IgnoreImagesMiddleware
 from vllm.exceptions import VLLMValidationError
 
 _convert = AnthropicServingMessages.to_chat_completion_request
 _img_url = AnthropicServingMessages._convert_image_source_to_url
+
+
+@pytest.fixture
+def ignore_images_client():
+    app = FastAPI(root_path="/proxy")
+    app.add_middleware(IgnoreImagesMiddleware)
+
+    @app.api_route("/{path:path}", methods=["GET", "POST"])
+    async def echo(request: Request):
+        return Response(
+            await request.body(),
+            media_type="application/json",
+            headers={
+                "X-Input-Length": request.headers.get("content-length", ""),
+            },
+        )
+
+    with TestClient(app) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    "path", ["/proxy/v1/messages", "/proxy/v1/messages/count_tokens"]
+)
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"type": "url", "url": "https://example.com/image.png"},
+        {"type": "base64", "media_type": "image/png", "data": "AAAA"},
+    ],
+)
+def test_ignore_images_preserves_tool_conversation(ignore_images_client, path, source):
+    """Image-only turns and mixed tool results remain valid text conversations."""
+    image = {"type": "image", "source": source}
+    tool_use = {
+        "type": "tool_use",
+        "id": "read-1",
+        "name": "Read",
+        "input": {"file_path": "image.png", "content": [image]},
+    }
+    tool_text = {"type": "text", "text": "Read output"}
+    tool_result = {
+        "type": "tool_result",
+        "tool_use_id": "read-1",
+        "is_error": False,
+        "content": [tool_text, image],
+    }
+    payload = {
+        "model": "text-model",
+        "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": [image]},
+            {"role": "assistant", "content": [tool_use]},
+            {"role": "user", "content": [tool_result]},
+        ],
+    }
+    response = ignore_images_client.post(path, json=payload)
+    assert response.status_code == 200
+    assert int(response.headers["X-Input-Length"]) == len(response.content)
+    result = response.json()
+    placeholder = result["messages"][0]["content"][0]
+    assert placeholder["type"] == "text"
+    assert "Image omitted" in placeholder["text"]
+    assert result == {
+        **payload,
+        "messages": [
+            {"role": "user", "content": [placeholder]},
+            {"role": "assistant", "content": [tool_use]},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        **tool_result,
+                        "content": [tool_text, placeholder],
+                    }
+                ],
+            },
+        ],
+    }
+    converted = _convert(AnthropicMessagesRequest.model_validate(result))
+    assert len(converted.messages) == 3
+    assert converted.messages[-1] == {
+        "role": "tool",
+        "tool_call_id": "read-1",
+        "content": "Read output\n" + placeholder["text"],
+    }
+
+
+def test_ignore_images_openai_content(ignore_images_client):
+    response = ignore_images_client.post(
+        "/proxy/v1/chat/completions",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Continue"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    parts = response.json()["messages"][0]["content"]
+    assert parts[0] == {"type": "text", "text": "Continue"}
+    assert parts[1]["type"] == "text"
+    assert "Image omitted" in parts[1]["text"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{ "messages": [{"role": "user", "content": "hello"}] }',
+        b'{"messages": [',
+        b"null",
+    ],
+)
+def test_ignore_images_preserves_unmodified_bodies(ignore_images_client, body):
+    """Text and invalid requests retain their original bytes for downstream handling."""
+    response = ignore_images_client.post(
+        "/proxy/v1/messages",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.content == body
+
+
+@pytest.mark.parametrize(
+    "path,method,content_type",
+    [
+        ("/proxy/other", "POST", "application/json"),
+        ("/proxy/v1/messages", "GET", "application/json"),
+        ("/proxy/v1/messages", "POST", "text/plain"),
+    ],
+)
+def test_ignore_images_leaves_other_requests_unchanged(
+    ignore_images_client, path, method, content_type
+):
+    body = b'{"messages": [{"content": [{"type": "image", "source": {}}]}]}'
+    response = ignore_images_client.request(
+        method, path, content=body, headers={"Content-Type": content_type}
+    )
+    assert response.content == body
+
+
+@pytest.mark.asyncio
+async def test_ignore_images_authentication_precedes_body_read():
+    """Unauthorized requests must be rejected before buffering their bodies."""
+    sent = []
+
+    async def receive():
+        pytest.fail("Read an unauthorized request body")
+
+    async def send(message):
+        sent.append(message)
+
+    async def app(scope, receive, send):
+        pytest.fail("Forwarded an unauthorized request")
+
+    await IgnoreImagesMiddleware(AuthenticationMiddleware(app, tokens=["secret"]))(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [(b"content-type", b"application/json")],
+        },
+        receive,
+        send,
+    )
+    assert sent[0]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_ignore_images_preserves_streaming_and_disconnect():
+    """Buffer chunked input without swallowing disconnects or changing SSE output."""
+    body = b'{"messages": [{"content": [{"type": "image", "source": {}}]}]}'
+    incoming = iter(
+        [
+            {"type": "http.request", "body": body[:20], "more_body": True},
+            {"type": "http.request", "body": body[20:], "more_body": False},
+            {"type": "http.disconnect"},
+        ]
+    )
+    outgoing = [
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(b"content-type", b"text/event-stream")],
+        },
+        {"type": "http.response.body", "body": b"data: first\n\n", "more_body": True},
+        {"type": "http.response.body", "body": b"data: last\n\n", "more_body": False},
+    ]
+    sent = []
+
+    async def receive():
+        return next(incoming)
+
+    async def send(message):
+        sent.append(message)
+
+    async def app(scope, receive, send):
+        request = Request(scope, receive)
+        payload = await request.json()
+        assert payload["messages"][0]["content"][0]["type"] == "text"
+        assert int(request.headers["content-length"]) == len(await request.body())
+        assert "transfer-encoding" not in request.headers
+        for message in outgoing:
+            await send(message)
+        assert await receive() == {"type": "http.disconnect"}
+
+    await IgnoreImagesMiddleware(app)(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"transfer-encoding", b"chunked"),
+            ],
+        },
+        receive,
+        send,
+    )
+    assert sent == outgoing
 
 
 def _make_request(

@@ -73,6 +73,36 @@ If the model responds correctly, your setup is working. You can now use Claude C
 
 ## Troubleshooting
 
+### Images sent to a text-only model
+
+Claude Code can include images in conversation history or tool results. A
+text-only model rejects these requests with `is not a multimodal model`.
+Retrying or running `/compact` can repeat the error while the image remains
+in the history sent to the server.
+
+To let text-only tasks continue, opt in to replacing image blocks with text
+placeholders by adding this argument to your existing `vllm serve` command:
+
+```bash
+--middleware vllm.entrypoints.serve.middleware.ignore_images.IgnoreImagesMiddleware
+```
+
+The middleware handles both top-level images and images inside tool results,
+preserving text and tool-call IDs. It applies to `/v1/messages`,
+`/v1/messages/count_tokens`, and `/v1/chat/completions`, including images
+resent from earlier conversation turns. Other endpoints are unchanged.
+
+!!! warning
+    This explicitly discards image contents; it does not add vision or OCR
+    capabilities. Enable it only when ignoring images is acceptable. The
+    placeholders tell the model to use text-only tools or request a text
+    description. Without this middleware, image handling is unchanged.
+
+Setting `--language-model-only` or `--limit-mm-per-prompt '{"image": 0}'`
+does not replace images with text: those options restrict multimodal inputs.
+
+### Other errors
+
 **Connection refused**: Ensure vLLM is running and accessible at the specified URL. Check that the port matches.
 
 **Tool calls not working**: Verify that your model supports tool calling and that you've enabled it with the correct `--tool-call-parser` flag. See [Tool Calling](../../features/tool_calling.md).
