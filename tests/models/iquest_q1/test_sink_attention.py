@@ -23,15 +23,20 @@ except ImportError:
 
 
 @pytest.mark.skipif(
-    not current_platform.is_device_capability(90), reason="Hopper FP8 decode"
+    not current_platform.is_device_capability(90), reason="Hopper small-batch decode"
 )
 @pytest.mark.parametrize("num_tokens", [1, 6, 8])
 @pytest.mark.parametrize("seq_len", [17, 4097])
 @pytest.mark.parametrize("window", [None, 17, 4096])
-@pytest.mark.parametrize("q_scale", [1.0, 0.3])
+@pytest.mark.parametrize("page_size", [16, 32])
+@pytest.mark.parametrize(
+    "kv_cache_dtype,q_scale", [("auto", 1.0), ("fp8_e4m3", 1.0), ("fp8_e4m3", 0.3)]
+)
 @torch.inference_mode()
-def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale):
-    """FP8 decode preserves causal/SWA masks, cache scales and learned sinks."""
+def test_small_batch_sink_matches_dense(
+    num_tokens, seq_len, window, page_size, kv_cache_dtype, q_scale
+):
+    """Decode preserves masks and learned sinks when graph inputs change."""
     from types import SimpleNamespace
 
     from vllm.models.iquest_q1.attention import IQuestFlashAttentionImpl
@@ -39,16 +44,17 @@ def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale
 
     set_random_seed(93010)
     device = "cuda"
-    page_size, heads, dim = 16, 6, 128
+    heads, dim = 6, 128
+    quantized = kv_cache_dtype.startswith("fp8")
     pages = (seq_len + page_size - 1) // page_size
     query = torch.randn(
         num_tokens + 2, heads + 1, dim, device=device, dtype=torch.bfloat16
     )[1:, :heads]
-    cache = (
-        torch.randn(pages, 1, page_size, 2 * dim, device=device, dtype=torch.bfloat16)
-        .to(torch.float8_e4m3fn)
-        .view(torch.uint8)
+    cache = torch.randn(
+        pages, 1, page_size, 2 * dim, device=device, dtype=torch.bfloat16
     )
+    if quantized:
+        cache = cache.to(torch.float8_e4m3fn).view(torch.uint8)
     table = torch.randperm(pages, device=device).int().view(1, -1)
     lengths = torch.tensor([seq_len], device=device, dtype=torch.int32)
     query_start = torch.tensor([0, num_tokens], device=device, dtype=torch.int32)
@@ -72,7 +78,9 @@ def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale
         prefix_kv_lens=None,
         suffix_kv_lens=None,
     )
-    impl = IQuestFlashAttentionImpl(heads, dim, dim**-0.5, 1, None, window, "fp8_e4m3")
+    impl = IQuestFlashAttentionImpl(
+        heads, dim, dim**-0.5, 1, None, window, kv_cache_dtype
+    )
     impl.vllm_flash_attn_version = 3
     output = torch.full(
         (num_tokens + 2, heads + 1, dim), -73, device=device, dtype=torch.bfloat16
@@ -82,13 +90,16 @@ def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale
         impl.forward(layer, query, None, None, cache, metadata, output)
 
     def dense(active_tokens, active_seq_len):
-        packed = cache.view(torch.float8_e4m3fn).float()[table[0].long()]
+        packed = cache.view(torch.float8_e4m3fn) if quantized else cache
+        packed = packed.float()[table[0].long()]
         key, value = packed.reshape(-1, 2 * dim)[:active_seq_len].chunk(2, -1)
-        key = key * layer._k_scale
-        value = value * layer._v_scale
         q = query[:active_tokens].float()
-        qdq = (q / layer._q_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
-        qdq = qdq.float() * layer._q_scale
+        qdq = q
+        if quantized:
+            key = key * layer._k_scale
+            value = value * layer._v_scale
+            qdq = (q / layer._q_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+            qdq = qdq.float() * layer._q_scale
         scores = torch.einsum("mhd,nd->mhn", qdq, key) * dim**-0.5
         query_positions = torch.arange(
             active_seq_len - active_tokens, active_seq_len, device=device
@@ -117,6 +128,9 @@ def test_small_batch_fp8_sink_matches_dense(num_tokens, seq_len, window, q_scale
     # Replay uses new device lengths without recapturing the padded query shape.
     query_start[1] = 1
     lengths[0] = seq_len - 1
+    query.mul_(0.5)
+    table.copy_(table.flip(-1).clone())
+    layer.sink_key.mul_(2)
     graph.replay()
     torch.testing.assert_close(
         output[:1].float(), dense(1, seq_len - 1), atol=1e-2, rtol=1e-2

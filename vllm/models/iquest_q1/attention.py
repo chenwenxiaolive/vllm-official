@@ -10,6 +10,7 @@ from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention import Attention
+from vllm.models.iquest_q1.bf16_attention import bf16_paged_attention
 from vllm.models.iquest_q1.fp8_attention import fp8_paged_attention
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -205,6 +206,34 @@ class IQuestFlashAttentionImpl(fa.FlashAttentionImpl):
             )
         num_tokens = attn_metadata.num_actual_tokens
         if num_tokens == 0:
+            return output
+        if (
+            self.vllm_flash_attn_version == 3
+            and current_platform.is_device_capability(90)
+            and not self.batch_invariant_enabled
+            and num_tokens in (1, 6)
+            and attn_metadata.query_start_loc.shape[0] == 2
+            and self.num_heads == 6
+            and self.num_kv_heads == 1
+            and self.head_size == 128
+            and query.dtype == kv_cache.dtype == output.dtype == torch.bfloat16
+            and query.stride(-1) == output.stride(-1) == 1
+            and kv_cache.is_contiguous()
+            and kv_cache.shape[2] in (16, 32)
+            and (self.sliding_window[0] >= 0 or attn_metadata.max_seq_len <= 131072)
+        ):
+            window = self.sliding_window[0] + 1 if self.sliding_window[0] >= 0 else 0
+            bf16_paged_attention(
+                query[:num_tokens],
+                kv_cache,
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.query_start_loc,
+                layer.sink_key,
+                output[:num_tokens],
+                window,
+                self.scale,
+            )
             return output
         if (
             is_quantized_kv_cache(self.kv_cache_dtype)
