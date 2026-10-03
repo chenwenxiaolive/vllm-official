@@ -8,6 +8,7 @@ Run `pytest tests/kernels/moe/test_fused_topk.py`.
 import pytest
 import torch
 
+import vllm._custom_ops as ops
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -275,3 +276,45 @@ def test_fused_topk_bias_nan_inf_clamp(
             f"Row {row} has non-finite weights {topk_weights[row].tolist()} "
             f"(bad_value={bad_value}, scoring_func={scoring_func})"
         )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="Requires a CUDA or ROCm device."
+)
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("padding", [False, True])
+def test_top8_softmax_ties_and_padding(renormalize: bool, padding: bool):
+    """Small decode batches preserve tie ordering and padded source indices."""
+    logits = torch.zeros((6, 256), device="cuda", dtype=torch.float32)
+    logits[1].fill_(1)
+    logits[2].fill_(torch.nan)
+    logits[3].fill_(torch.inf)
+    logits[4].fill_(-torch.inf)
+    logits[5] = -torch.arange(256, device="cuda", dtype=torch.float32)
+    mask = torch.arange(6, device="cuda") % 2 == 1 if padding else None
+    weights = torch.empty((6, 8), device="cuda", dtype=torch.float32)
+    ids = torch.empty((6, 8), device="cuda", dtype=torch.int32)
+    rows = torch.empty_like(ids)
+    ops.topk_softmax(weights, ids, rows, logits, renormalize, is_padding=mask)
+
+    expected_ids = torch.arange(8, device="cuda", dtype=torch.int32).repeat(6, 1)
+    if mask is not None:
+        expected_ids[mask] = -1
+    expected_rows = (
+        torch.arange(8, device="cuda") * 6 + torch.arange(6, device="cuda")[:, None]
+    ).to(torch.int32)
+    torch.testing.assert_close(ids, expected_ids, rtol=0, atol=0)
+    torch.testing.assert_close(rows, expected_rows, rtol=0, atol=0)
+    torch.testing.assert_close(
+        weights[:2],
+        torch.full_like(weights[:2], 1 / (8 if renormalize else 256)),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        weights[2:5], torch.zeros_like(weights[2:5]), rtol=0, atol=0
+    )
+    expected_weights = torch.softmax(logits[5], dim=0)[:8]
+    if renormalize:
+        expected_weights /= expected_weights.sum()
+    torch.testing.assert_close(weights[5], expected_weights)

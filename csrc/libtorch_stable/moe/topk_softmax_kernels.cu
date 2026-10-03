@@ -276,12 +276,20 @@ __launch_bounds__(TPB) __global__ void moeTopK(
 */
 
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG, int WARP_SIZE_PARAM, typename IndType,
-          typename InputType = float, ScoringFunc SF>
+          typename InputType = float, ScoringFunc SF, bool SMALL_TOP8 = false, bool RENORMALIZE = false>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
-    void topkGating(const InputType* input, const bool* finished, float* output, const int num_rows, IndType* indices,
-        int* source_rows, const int k, const int start_expert, const int end_expert, const bool renormalize,
-        const float* bias, const double routed_scaling_factor, const bool* is_padding)
+    void topkGating(const InputType* input, const bool* finished_arg, float* output, const int num_rows, IndType* indices,
+        int* source_rows, const int k_arg, const int start_expert_arg, const int end_expert_arg, const bool renormalize_arg,
+        const float* bias_arg, const double routed_scaling_factor_arg, const bool* is_padding)
 {
+    const bool* finished = SMALL_TOP8 ? nullptr : finished_arg;
+    const int k = SMALL_TOP8 ? 8 : k_arg;
+    const int start_expert = SMALL_TOP8 ? 0 : start_expert_arg;
+    const int end_expert = SMALL_TOP8 ? 256 : end_expert_arg;
+    const bool renormalize = SMALL_TOP8 ? RENORMALIZE : renormalize_arg;
+    const float* bias = SMALL_TOP8 ? nullptr : bias_arg;
+    const double routed_scaling_factor = SMALL_TOP8 ? 1.0 : routed_scaling_factor_arg;
+
     static_assert(std::is_same_v<InputType, float> || std::is_same_v<InputType, __nv_bfloat16> ||
                       std::is_same_v<InputType, __half>,
                   "InputType must be float, __nv_bfloat16, or __half");
@@ -497,6 +505,8 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
     int start_col = first_elt_read_by_thread;
 
     float selected_sum = 0.f;
+    float selected_weight = 0.f;
+    int selected_expert = 0;
     for (int k_idx = 0; k_idx < k; ++k_idx)
     {
         // First, each thread does the local argmax
@@ -526,40 +536,66 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
 // Now, we perform the argmax reduce. We use the butterfly pattern so threads reach consensus about the max.
 // This will be useful for K > 1 so that the threads can agree on "who" had the max value. That thread can
 // then blank out their max with -inf and the warp can run more iterations...
-#pragma unroll
-        for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
-        {
-            float other_max_for_choice = VLLM_SHFL_XOR_SYNC_WIDTH(max_val_for_choice, mask, THREADS_PER_ROW);
-            float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
-            int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
 
-            // We want lower indices to "win" in every thread so we break ties this way
-            if (other_max_for_choice > max_val_for_choice || (other_max_for_choice == max_val_for_choice && other_expert < expert))
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+        if constexpr (SMALL_TOP8) {
+            // Before the eighth choice, each lane retains a nonnegative score.
+            const auto bits = __reduce_max_sync(0xffffffffu, __float_as_uint(max_val));
+            const float winner = __uint_as_float(bits);
+            const auto winner_expert = __reduce_min_sync(
+                0xffffffffu, max_val == winner ?
+                    static_cast<unsigned int>(expert) : 0xffffffffu);
+            max_val = winner;
+            max_val_for_choice = winner;
+            expert = static_cast<int>(winner_expert);
+        } else
+#endif
+        {
+#pragma unroll
+            for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2)
             {
-                max_val_for_choice = other_max_for_choice;
-                max_val = other_max;
-                expert = other_expert;
+                float other_max_for_choice = VLLM_SHFL_XOR_SYNC_WIDTH(max_val_for_choice, mask, THREADS_PER_ROW);
+                float other_max = VLLM_SHFL_XOR_SYNC_WIDTH(max_val, mask, THREADS_PER_ROW);
+                int other_expert = VLLM_SHFL_XOR_SYNC_WIDTH(expert, mask, THREADS_PER_ROW);
+
+                // We want lower indices to "win" in every thread so we break ties this way
+                if (other_max_for_choice > max_val_for_choice || (other_max_for_choice == max_val_for_choice && other_expert < expert))
+                {
+                    max_val_for_choice = other_max_for_choice;
+                    max_val = other_max;
+                    expert = other_expert;
+                }
             }
+
         }
 
-        // Write the max for this k iteration to global memory.
-        if (thread_group_idx == 0)
-        {
-            // Add a guard to ignore experts not included by this node
-            const bool node_uses_expert = expert >= start_expert && expert < end_expert;
-            const bool should_process_row = row_is_active && node_uses_expert;
-            const bool is_pad_row = is_padding != nullptr && is_padding[thread_row];
-
-            // The lead thread from each sub-group will write out the final results to global memory. (This will be a
-            // single) thread per row of the input/output matrices.
-            const int idx = k * thread_row + k_idx;
-            output[idx] = max_val;
-            indices[idx] = is_pad_row ? static_cast<IndType>(-1)
-                                       : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
-            source_rows[idx] = k_idx * num_rows + thread_row;
-            if (renormalize) {
-                selected_sum += max_val;
+        if constexpr (SMALL_TOP8) {
+            if (thread_group_idx == k_idx) {
+                selected_weight = max_val;
+                selected_expert = expert;
             }
+            if (renormalize) selected_sum += max_val;
+        } else {
+            // Write the max for this k iteration to global memory.
+            if (thread_group_idx == 0)
+            {
+                // Add a guard to ignore experts not included by this node
+                const bool node_uses_expert = expert >= start_expert && expert < end_expert;
+                const bool should_process_row = row_is_active && node_uses_expert;
+                const bool is_pad_row = is_padding != nullptr && is_padding[thread_row];
+
+                // The lead thread from each sub-group will write out the final results to global memory. (This will be a
+                // single) thread per row of the input/output matrices.
+                const int idx = k * thread_row + k_idx;
+                output[idx] = max_val;
+                indices[idx] = is_pad_row ? static_cast<IndType>(-1)
+                                           : (should_process_row ? (expert - start_expert) : NUM_EXPERTS);
+                source_rows[idx] = k_idx * num_rows + thread_row;
+                if (renormalize) {
+                    selected_sum += max_val;
+                }
+            }
+
         }
 
         // Finally, we clear the value in the thread with the current max if there is another iteration to run.
@@ -578,17 +614,32 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE_PARAM) __global__
         }
     }
 
-    // Apply renormalization and routed scaling factor to final weights.
-    if (thread_group_idx == 0) {
-      float scale = static_cast<float>(routed_scaling_factor);
-      if (renormalize) {
-        const float denom = selected_sum > 0.f ? selected_sum : 1.f;
-        scale /= denom;
-      }
-      for (int k_idx = 0; k_idx < k; ++k_idx) {
-        const int idx = k * thread_row + k_idx;
-        output[idx] = output[idx] * scale;
-      }
+    if constexpr (SMALL_TOP8) {
+        if (thread_group_idx < 8) {
+            float scale = 1.f;
+            if (renormalize) {
+                const float denom = selected_sum > 0.f ? selected_sum : 1.f;
+                scale /= denom;
+            }
+            const int idx = 8 * thread_row + thread_group_idx;
+            const bool pad = is_padding != nullptr && is_padding[thread_row];
+            output[idx] = selected_weight * scale;
+            indices[idx] = pad ? static_cast<IndType>(-1) : selected_expert;
+            source_rows[idx] = thread_group_idx * num_rows + thread_row;
+        }
+    } else {
+        // Apply renormalization and routed scaling factor to final weights.
+        if (thread_group_idx == 0) {
+          float scale = static_cast<float>(routed_scaling_factor);
+          if (renormalize) {
+            const float denom = selected_sum > 0.f ? selected_sum : 1.f;
+            scale /= denom;
+          }
+          for (int k_idx = 0; k_idx < k; ++k_idx) {
+            const int idx = k * thread_row + k_idx;
+            output[idx] = output[idx] * scale;
+          }
+        }
     }
 }
 
@@ -675,6 +726,30 @@ void topkGatingKernelLauncher(
     // elements can be loaded by a warp
     static constexpr int BYTES_PER_LDG_MULTIPLE_64 =
     (std::is_same_v<InputType, __nv_bfloat16> || std::is_same_v<InputType, __half>) ? 4 : 8;
+#endif
+#ifndef USE_ROCM
+    if constexpr (std::is_same_v<InputType, float> &&
+                  std::is_same_v<IndType, int> && SF == SCORING_SOFTMAX) {
+        if (num_tokens == 6 && num_experts == 256 && topk == 8 &&
+            bias == nullptr && routed_scaling_factor == 1.0 &&
+            reinterpret_cast<uintptr_t>(gating_output) % 16 == 0 &&
+            get_device_prop()->major == 9) {
+            if (renormalize) {
+                topkGating<8, 256, 4, 16, 32, int, float, SF, true, true>
+                    <<<2, dim3(32, 4), 0, stream>>>(
+                        gating_output, nullptr, topk_weights, num_tokens,
+                        topk_indices, token_expert_indices, topk, 0, num_experts,
+                        true, nullptr, 1.0, is_padding);
+            } else {
+                topkGating<8, 256, 4, 16, 32, int, float, SF, true, false>
+                    <<<2, dim3(32, 4), 0, stream>>>(
+                        gating_output, nullptr, topk_weights, num_tokens,
+                        topk_indices, token_expert_indices, topk, 0, num_experts,
+                        false, nullptr, 1.0, is_padding);
+            }
+            return;
+        }
+    }
 #endif
     switch (num_experts) {
         case 1:

@@ -107,6 +107,7 @@ def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, senti
 def _topk_topp_kernel(
     LOGITS,
     LOGITS_STRIDE_0,
+    STATS,
     BUFFER,
     PERCENTILE_TO_STD_TABLE,
     NORMAL_CDF_TO_SIGMA_TABLE,
@@ -120,6 +121,7 @@ def _topk_topp_kernel(
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
     SPLIT_COVERS_PONLY: tl.constexpr,
+    PARALLEL_GATHER: tl.constexpr,
 ):
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
@@ -171,30 +173,41 @@ def _topk_topp_kernel(
                 outlier_pivot = avg_logit + std_logit * sigma
                 num_outliers = tl.zeros((), dtype=tl.uint32)
 
-                # First pass: compute max and min logits and gather outliers
-                num_finite_total = tl.zeros((), dtype=tl.uint32)
-                for i in range(0, NUM_TILES):
-                    offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                    mask_n = offs_n < VOCAB_SIZE
-                    logits_blk = tl.load(
-                        LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
+                if PARALLEL_GATHER:
+                    ti = tl.arange(0, triton.next_power_of_2(NUM_TILES))
+                    state = STATS + (row_id * NUM_TILES + ti) * 4
+                    valid_tile = ti < NUM_TILES
+                    num_outliers = tl.sum(tl.load(state, valid_tile, 0).to(tl.uint32))
+                    num_finite_total = tl.sum(
+                        tl.load(state + 1, valid_tile, 0).to(tl.uint32)
                     )
+                    min_logit = tl.min(tl.load(state + 2, valid_tile, float("inf")))
+                    max_logit = tl.max(tl.load(state + 3, valid_tile, -float("inf")))
+                else:
+                    # First pass: compute max and min logits and gather outliers
+                    num_finite_total = tl.zeros((), dtype=tl.uint32)
+                    for i in range(0, NUM_TILES):
+                        offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                        mask_n = offs_n < VOCAB_SIZE
+                        logits_blk = tl.load(
+                            LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
+                        )
 
-                    max_logit = tl.maximum(max_logit, tl.max(logits_blk))
-                    # Exclude -inf from min to keep binary search bounds
-                    # finite (avoids NaN pivots).
-                    finite_blk_mask = logits_blk > -float("inf")
-                    finite_blk = tl.where(finite_blk_mask, logits_blk, float("inf"))
-                    min_logit = tl.minimum(min_logit, tl.min(finite_blk))
-                    num_finite_total += tl.sum(finite_blk_mask & mask_n)
+                        max_logit = tl.maximum(max_logit, tl.max(logits_blk))
+                        # Exclude -inf from min to keep binary search bounds
+                        # finite (avoids NaN pivots).
+                        finite_blk_mask = logits_blk > -float("inf")
+                        finite_blk = tl.where(finite_blk_mask, logits_blk, float("inf"))
+                        min_logit = tl.minimum(min_logit, tl.min(finite_blk))
+                        num_finite_total += tl.sum(finite_blk_mask & mask_n)
 
-                    outlier_mask = (logits_blk > outlier_pivot) & mask_n
-                    cumulative_pos = tl.cast(
-                        tl.cumsum(outlier_mask) - 1 + num_outliers, tl.int32
-                    )
-                    num_outliers += tl.sum(outlier_mask)
-                    write_pos = tl.where(outlier_mask, cumulative_pos, -1)
-                    tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
+                        outlier_mask = (logits_blk > outlier_pivot) & mask_n
+                        cumulative_pos = tl.cast(
+                            tl.cumsum(outlier_mask) - 1 + num_outliers, tl.int32
+                        )
+                        num_outliers += tl.sum(outlier_mask)
+                        write_pos = tl.where(outlier_mask, cumulative_pos, -1)
+                        tl.store(BUFFER_ROW + write_pos, logits_blk, mask=outlier_mask)
 
                 # If no finite logits exist (all -inf), clamp min to
                 # max so the search converges to -inf (no masking).
@@ -312,34 +325,49 @@ def _topk_topp_kernel(
                         min_larger_1 = float("inf")
                         num_min_larger_1 = tl.zeros((), dtype=tl.uint32)
 
-                        # Single fused pass over full vocab (same approach
-                        # as the buffer path above).
+                        # Cached tile maxima rule out empty pivot reductions
+                        # without loading the corresponding logits.
                         for i in range(0, NUM_TILES):
-                            offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-                            mask_n = offs_n < VOCAB_SIZE
-                            logits_blk2 = tl.load(
-                                LOGITS_ROW + offs_n, mask=mask_n, other=-float("inf")
-                            )
-
-                            above_0 = logits_blk2 > k_pivot_0
-                            above_1 = logits_blk2 > k_pivot_1
-                            k_pivots_num_0 += tl.sum(above_0)
-                            k_pivots_num_1 += tl.sum(above_1)
-
-                            min_larger_0, num_min_larger_0 = _update_min_larger_stats(
-                                logits_blk2,
-                                above_0,
-                                min_larger_0,
-                                num_min_larger_0,
-                                float("inf"),
-                            )
-                            min_larger_1, num_min_larger_1 = _update_min_larger_stats(
-                                logits_blk2,
-                                above_1,
-                                min_larger_1,
-                                num_min_larger_1,
-                                float("inf"),
-                            )
+                            scan_0 = True
+                            scan_1 = True
+                            if PARALLEL_GATHER:
+                                tile_max = tl.load(
+                                    STATS + (row_id * NUM_TILES + i) * 4 + 3
+                                )
+                                scan_0 = tile_max > k_pivot_0
+                                scan_1 = tile_max > k_pivot_1
+                            if scan_0 | scan_1:
+                                offs_n = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+                                mask_n = offs_n < VOCAB_SIZE
+                                logits_blk2 = tl.load(
+                                    LOGITS_ROW + offs_n,
+                                    mask=mask_n,
+                                    other=-float("inf"),
+                                )
+                                if scan_0:
+                                    above_0 = logits_blk2 > k_pivot_0
+                                    k_pivots_num_0 += tl.sum(above_0)
+                                    min_larger_0, num_min_larger_0 = (
+                                        _update_min_larger_stats(
+                                            logits_blk2,
+                                            above_0,
+                                            min_larger_0,
+                                            num_min_larger_0,
+                                            float("inf"),
+                                        )
+                                    )
+                                if scan_1:
+                                    above_1 = logits_blk2 > k_pivot_1
+                                    k_pivots_num_1 += tl.sum(above_1)
+                                    min_larger_1, num_min_larger_1 = (
+                                        _update_min_larger_stats(
+                                            logits_blk2,
+                                            above_1,
+                                            min_larger_1,
+                                            num_min_larger_1,
+                                            float("inf"),
+                                        )
+                                    )
 
                         # Check if any of the pivots satisfy termination condition
                         if (
@@ -875,6 +903,205 @@ def _topk_topp_kernel(
                 tl.store(LOGITS_ROW + offs_n, logits_blk, mask=mask_n)
 
 
+# Parallelize the first vocabulary sweep while preserving the gathered token
+# order and the monolithic kernel's pivot and probability calculations.
+_TOPK_PARALLEL_MAX_BATCH = 64
+_TOPK_PARALLEL_MIN_VOCAB = 32768
+_TRITON_TOPK_GATHER_CACHE: dict[
+    tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+@triton.jit
+def _topk_gather_tiles_kernel(
+    LOGITS,
+    LOGITS_STRIDE_0,
+    K,
+    PERCENTILE_TO_STD_TABLE,
+    TILES,
+    STATS,
+    VOCAB: tl.constexpr,
+    NT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) // NT
+    tile = tl.program_id(0) % NT
+    k = tl.load(K + row)
+    if k >= VOCAB:
+        return
+    ROW = LOGITS + row.to(tl.int64) * LOGITS_STRIDE_0
+    offs = tl.arange(0, BLOCK)
+    sample = tl.load(ROW + offs, offs < VOCAB, -float("inf"))
+    finite = (sample > -float("inf")) & (offs < VOCAB)
+    count = tl.sum(finite)
+    finite_logits = tl.where(finite, sample, 0.0)
+    avg = tl.where(count > 0, tl.sum(finite_logits) / count, 0.0)
+    sq_avg = tl.where(count > 0, tl.sum(finite_logits * finite_logits) / count, 0.0)
+    std = tl.sqrt(tl.maximum(sq_avg - avg * avg, 0.0))
+    percentile = tl.minimum(tl.cast(k / VOCAB * 200, tl.uint32), 199)
+    sigma = tl.load(PERCENTILE_TO_STD_TABLE + percentile)
+    sigma = sigma + tl.abs(sigma) * -0.15
+    pivot = avg + std * sigma
+    indices = tile * BLOCK + offs
+    valid = indices < VOCAB
+    values = tl.load(ROW + indices, valid, -float("inf"))
+    outlier = (values > pivot) & valid
+    dest = tl.cumsum(outlier) - 1
+    tl.store(TILES + (row.to(tl.int64) * NT + tile) * BLOCK + dest, values, outlier)
+    state = STATS + (row * NT + tile) * 4
+    finite = (values > -float("inf")) & valid
+    tl.store(state, tl.sum(outlier))
+    tl.store(state + 1, tl.sum(finite))
+    tl.store(state + 2, tl.min(tl.where(finite, values, float("inf"))))
+    tl.store(state + 3, tl.max(values))
+
+
+@triton.jit
+def _topk_compact_tiles_kernel(
+    TILES,
+    STATS,
+    BUFFER,
+    K,
+    VOCAB: tl.constexpr,
+    NT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    NT_PAD: tl.constexpr,
+):
+    row = tl.program_id(0) // NT
+    tile = tl.program_id(0) % NT
+    if tl.load(K + row) >= VOCAB:
+        return
+    ti = tl.arange(0, NT_PAD)
+    counts = tl.load(STATS + (row * NT + ti) * 4, ti < NT, 0).to(tl.int32)
+    offset = tl.sum(tl.where(ti < tile, counts, 0))
+    count = tl.sum(tl.where(ti == tile, counts, 0))
+    offsets = tl.arange(0, BLOCK)
+    values = tl.load(
+        TILES + (row.to(tl.int64) * NT + tile) * BLOCK + offsets, offsets < count, 0
+    )
+    tl.store(
+        BUFFER + row.to(tl.int64) * VOCAB + offset + offsets, values, offsets < count
+    )
+
+
+def _topk_gather_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    _when(current_platform.is_cuda() and vocab_size >= _TOPK_PARALLEL_MIN_VOCAB)
+    batch_size: Any = WarmupIntRange(
+        1,
+        min(
+            _max_sampler_batch_size(vllm_config),
+            _TOPK_PARALLEL_MAX_BATCH,
+            num_compute_units(),
+        )
+        + 1,
+    )
+    stride: Any = WarmupChoices(16, 2)
+    aligned: Any = WarmupChoices(True, False)
+    return dict(
+        logits=TritonWarmupTensor(
+            torch.float32,
+            aligned=aligned,
+            shape=(batch_size, vocab_size),
+            strides=(stride, 1),
+        ),
+        k=TritonWarmupTensor(torch.int32),
+        percentile_to_std_table=TritonWarmupTensor(torch.float32),
+        tiles=TritonWarmupTensor(torch.float32),
+        stats=TritonWarmupTensor(torch.float32),
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_topk_gather_tiles_kernel,
+    warmup_inputs=_topk_gather_warmup_inputs,
+)
+def _topk_gather_tiles(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    percentile_to_std_table: torch.Tensor,
+    tiles: torch.Tensor,
+    stats: torch.Tensor,
+) -> DispatchSpec:
+    batch_size, vocab_size = logits.shape
+    num_tiles = triton.cdiv(vocab_size, 8192)
+    return (batch_size * num_tiles,), dict(
+        VOCAB=vocab_size,
+        NT=num_tiles,
+        BLOCK=8192,
+        num_warps=8,
+    )
+
+
+def _topk_compact_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
+    vocab_size = vllm_config.model_config.get_vocab_size()
+    _when(current_platform.is_cuda() and vocab_size >= _TOPK_PARALLEL_MIN_VOCAB)
+    batch_size: Any = WarmupIntRange(
+        1,
+        min(
+            _max_sampler_batch_size(vllm_config),
+            _TOPK_PARALLEL_MAX_BATCH,
+            num_compute_units(),
+        )
+        + 1,
+    )
+    stride: Any = WarmupChoices(16, 2)
+    return dict(
+        logits=TritonWarmupTensor(
+            torch.float32, shape=(batch_size, vocab_size), strides=(stride, 1)
+        ),
+        k=TritonWarmupTensor(torch.int32),
+        buffer=TritonWarmupTensor(torch.float32),
+        tiles=TritonWarmupTensor(torch.float32),
+        stats=TritonWarmupTensor(torch.float32),
+    )
+
+
+@triton_kernel_dispatcher_with_warmup(
+    kernel=_topk_compact_tiles_kernel,
+    warmup_inputs=_topk_compact_warmup_inputs,
+)
+def _topk_compact_tiles(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    tiles: torch.Tensor,
+    stats: torch.Tensor,
+    buffer: torch.Tensor,
+) -> DispatchSpec:
+    batch_size, vocab_size = logits.shape
+    num_tiles = triton.cdiv(vocab_size, 8192)
+    return (batch_size * num_tiles,), dict(
+        VOCAB=vocab_size,
+        NT=num_tiles,
+        BLOCK=8192,
+        NT_PAD=next_power_of_2(num_tiles),
+        num_warps=8,
+    )
+
+
+def _gather_topk_outliers(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    percentile_to_std_table: torch.Tensor,
+    buffer: torch.Tensor,
+) -> torch.Tensor:
+    batch_size, vocab_size = logits.shape
+    key = (logits.device, vocab_size)
+    workspace = _TRITON_TOPK_GATHER_CACHE.get(key)
+    if workspace is None or workspace[0].shape[0] < batch_size:
+        capacity = next_power_of_2(batch_size)
+        num_tiles = triton.cdiv(vocab_size, 8192)
+        workspace = (
+            logits.new_empty((capacity, num_tiles, 8192)),
+            logits.new_empty((capacity, num_tiles, 4)),
+        )
+        _TRITON_TOPK_GATHER_CACHE[key] = workspace
+    tiles, stats = workspace
+    _topk_gather_tiles(logits, k, percentile_to_std_table, tiles, stats)
+    _topk_compact_tiles(logits, k, tiles, stats, buffer)
+    return stats
+
+
 def _max_sampler_batch_size(vllm_config: Any) -> int:
     return vllm_config.scheduler_config.max_num_seqs * (
         vllm_config.num_speculative_tokens + 1
@@ -890,8 +1117,10 @@ def _topk_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
     topk_enabled = mode[0]
     topp_enabled = mode[1]
     _when(topk_enabled or not (split_enabled and batch_size <= _SPLIT_MAX_BATCH))
+    aligned: Any = WarmupChoices(True, False)
     logits = TritonWarmupTensor(
         torch.float32,
+        aligned=aligned,
         shape=(batch_size, vocab_size),
         strides=(logits_stride, 1),
     )
@@ -904,6 +1133,14 @@ def _topk_topp_warmup_inputs(vllm_config: Any) -> dict[str, Any]:
         p=TritonWarmupTensor(torch.float32) if topp_enabled else None,
         mask_value=float("-inf"),
         num_sm=num_compute_units(),
+        stats=(
+            TritonWarmupTensor(torch.float32)
+            if topk_enabled
+            and current_platform.is_cuda()
+            and vocab_size >= _TOPK_PARALLEL_MIN_VOCAB
+            and batch_size <= min(_TOPK_PARALLEL_MAX_BATCH, num_compute_units())
+            else None
+        ),
     )
 
 
@@ -920,6 +1157,7 @@ def _topk_topp(
     p: torch.Tensor | None,
     mask_value: float,
     num_sm: int,
+    stats: torch.Tensor | None = None,
 ) -> DispatchSpec:
     batch_size, vocab_size = logits.shape
     topk_enabled = k is not None
@@ -946,6 +1184,8 @@ def _topk_topp(
         and batch_size <= _SPLIT_MAX_BATCH
     )
     return (num_programs,), dict(
+        STATS=stats if stats is not None else logits,
+        PARALLEL_GATHER=stats is not None,
         K=k_ptr,
         P=p_ptr,
         BATCH_SIZE=batch_size,
@@ -1701,6 +1941,15 @@ def apply_top_k_top_p_triton(
     else:
         normal_cdf_to_sigma_table, percentile_to_std_table = tables
 
+    stats = None
+    if (
+        topk_enabled
+        and logits.device.type == "cuda"
+        and vocab_size >= _TOPK_PARALLEL_MIN_VOCAB
+        and batch_size <= min(_TOPK_PARALLEL_MAX_BATCH, num_sm)
+    ):
+        stats = _gather_topk_outliers(logits, k_ptr, percentile_to_std_table, buffer)
+
     _topk_topp(
         logits,
         buffer,
@@ -1710,6 +1959,7 @@ def apply_top_k_top_p_triton(
         p_ptr if topp_enabled else None,
         mask_value,
         num_sm,
+        stats=stats,
     )
     if use_split:
         _apply_topp_split(logits, k_ptr, p_ptr, mask_value, num_sm)
@@ -1721,4 +1971,5 @@ def reset_buffer_cache():
     _TRITON_BUFFER_CACHE.clear()
     _TRITON_TABLE_CACHE.clear()
     _TRITON_SPLIT_CACHE.clear()
+    _TRITON_TOPK_GATHER_CACHE.clear()
     torch.accelerator.empty_cache()

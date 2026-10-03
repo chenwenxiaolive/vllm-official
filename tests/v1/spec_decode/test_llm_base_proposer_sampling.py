@@ -75,16 +75,17 @@ def test_compute_probs_and_sample_next_token_uses_fp64_exponential_race():
 
 
 @pytest.mark.parametrize(
-    ("architecture", "expected"),
+    ("method", "architecture", "expected"),
     [
-        ("DeepSeekMTPModel", True),
-        ("KimiK3MTPModel", True),
-        ("MiniMaxM3ForCausalLM", False),
+        ("mtp", "DeepSeekMTPModel", True),
+        ("mtp", "KimiK3MTPModel", True),
+        ("mtp", "MiniMaxM3ForCausalLM", False),
+        ("mtp_recursive", "IQuestQ1MTP", False),
     ],
 )
-def test_mtp_model_returns_tuple(architecture: str, expected: bool):
+def test_mtp_model_returns_tuple(method: str, architecture: str, expected: bool):
     proposer = object.__new__(SpecDecodeBaseProposer)
-    proposer.method = "mtp"
+    proposer.method = method
     proposer.draft_model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=[architecture])
     )

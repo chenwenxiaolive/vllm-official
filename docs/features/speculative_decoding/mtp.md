@@ -67,6 +67,56 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
     --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
 ```
 
+## IQuestQ1 Recursive Drafts
+
+IQuestQ1 supports standalone `iquest_q1_mtp` checkpoints with the
+`IQuestQ1MTP` architecture. Select `eagle` and supply the draft checkpoint
+from the model's `mtp` directory. vLLM maps this entry point to its
+recursive MTP implementation:
+
+```bash
+vllm serve /path/to/iquest-q1 \
+    --tensor-parallel-size 8 \
+    --speculative-config '{"method":"eagle","model":"/path/to/iquest-q1/mtp","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"standard"}'
+```
+
+The native `method="mtp"` path is not supported for IQuestQ1. Embedded
+`mtp_layers.*` weights in target checkpoints are ignored.
+
+On H200, the built-in unquantized MoE configuration for 256 experts and
+192 intermediate channels per rank tunes the six-token verification batch
+used by a single request at depth five. Other batch sizes retain the generic
+launch parameters. This kernel configuration follows the usual device and
+shape lookup and also applies to other models with the same lookup key.
+
+For latency-focused H200 serving at depth five, add
+`--compilation-config '{"compile_sizes":[1,6]}'` to specialize the one-token
+draft and six-token verification batches. This setting adds static compiled
+partitions; other token counts retain dynamic compilation. It targets
+single-request decoding and increases compilation work at startup. Static
+compilation can select different floating-point kernels, so validate model
+scores as well as latency for the intended workload.
+
+The EAGLE proposer runs one physical draft layer repeatedly. Each step consumes
+the previous step's token and normalized hidden state and appends its own KV.
+The initial hidden state is the target's final normalized output. The draft's
+`target_config` supplies architecture dimensions; its own `sliding_window` and
+`swa_rope_theta` control draft attention. FP32 residual connections are honored
+when requested by the checkpoint.
+
+`moe_router_dtype` selects the router weight and computation dtype (`fp32`,
+`bf16`, or `fp16`, also accepting their full names). It defaults to FP32;
+the draft inherits it from `target_config` unless overridden at the top level.
+`enable_lm_head_fp32` selects FP32 output-head logits when true and the model
+dtype when false (the default). The draft has an independent top-level switch:
+it does not inherit this flag from `target_config`. Head weights stay in the
+model dtype.
+
+When omitted, `num_speculative_tokens` defaults to `num_draft_slots`. Depths
+beyond the training depth are allowed with a warning. Parallel drafting,
+diffusion drafts, dense FFN variants, and shared-KV variants are unsupported.
+The draft and target must have matching hidden sizes and vocabularies.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.
